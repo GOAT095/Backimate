@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 from __future__ import annotations
 
 import argparse
@@ -13,7 +12,6 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import uuid
 from pathlib import Path
 
 SWIFT_DESKTOP_PLAYER_SOURCE = r"""
@@ -39,7 +37,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupWindows()
-        // Rebuild windows automatically if displays are connected/disconnected or resolution changes
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensDidChange),
@@ -96,7 +93,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
                 imageView.canDrawSubviewsIntoLayer = true
 
                 if fillScreen && gifImage.size.width > 0 && gifImage.size.height > 0 {
-                    // Aspect-fill calculation so the GIF covers the entire monitor cleanly
                     let screenRatio = frame.width / frame.height
                     let imageRatio = gifImage.size.width / gifImage.size.height
                     var drawWidth = frame.width
@@ -168,13 +164,13 @@ guard FileManager.default.fileExists(atPath: url.path) else {
 }
 
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory) // Hide Dock icon and menu bar
+app.setActivationPolicy(.accessory)
 let delegate = WallpaperAppDelegate(mediaURL: url, isMuted: isMuted, fillScreen: fillScreen)
 app.delegate = delegate
 app.run()
 """
 
-SWIFT_GIF_CONVERTER_SOURCE = r"""
+SWIFT_MEDIA_CONVERTER_SOURCE = r"""
 import Foundation
 import ImageIO
 import AVFoundation
@@ -183,13 +179,46 @@ import CoreGraphics
 
 let args = CommandLine.arguments
 guard args.count >= 3 else {
-    fputs("Usage: gif_to_mov <input.gif> <output.mov>\n", stderr)
+    fputs("Usage: media_to_mov <input_file> <output.mov>\n", stderr)
     exit(1)
 }
 
 let inputURL = URL(fileURLWithPath: args[1])
 let outputURL = URL(fileURLWithPath: args[2])
+let ext = inputURL.pathExtension.lowercased()
 
+try? FileManager.default.removeItem(at: outputURL)
+
+// Mode 1: Remux or transcode .mp4 / .m4v / .mov into a clean QuickTime .mov container
+if ext != "gif" {
+    let asset = AVURLAsset(url: inputURL)
+    let semaphore = DispatchSemaphore(value: 0)
+    var exportSucceeded = false
+
+    let presets = [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality]
+    for preset in presets {
+        try? FileManager.default.removeItem(at: outputURL)
+        guard let session = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
+        session.outputURL = outputURL
+        session.outputFileType = .mov
+        session.shouldOptimizeForNetworkUse = true
+        session.exportAsynchronously {
+            if session.status == .completed {
+                exportSucceeded = true
+            }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        if exportSucceeded {
+            exit(0)
+        }
+    }
+
+    try? FileManager.default.copyItem(at: inputURL, to: outputURL)
+    exit(0)
+}
+
+// Mode 2: Convert animated .gif into a QuickTime .mov video
 guard let source = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
     fputs("Error: Could not read GIF source at \(inputURL.path)\n", stderr)
     exit(1)
@@ -206,7 +235,6 @@ let rawH = max(64, firstImage.height)
 let width = (rawW % 2 == 0) ? rawW : rawW + 1
 let height = (rawH % 2 == 0) ? rawH : rawH + 1
 
-// Try hardware codecs first (HEVC, H.264), falling back to universal Motion-JPEG inside .mov
 let candidateCodecs: [AVVideoCodecType] = [.hevc, .h264, .jpeg]
 var activeWriter: AVAssetWriter?
 var activeInput: AVAssetWriterInput?
@@ -303,12 +331,11 @@ func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, 
     return buffer
 }
 
-// Pad short GIFs so the resulting MOV is at least 5 seconds long for smooth Lock Screen playback
 var singleLoopDuration = 0.0
 for i in 0..<frameCount {
     singleLoopDuration += frameDuration(at: i, source: source)
 }
-let repeatCount = max(1, Int(ceil(5.0 / max(singleLoopDuration, 0.05))))
+let repeatCount = max(1, Int(ceil(6.0 / max(singleLoopDuration, 0.05))))
 
 let timescale: Int32 = 600
 var currentTime = CMTime.zero
@@ -355,7 +382,30 @@ AERIAL_SQLITE = AERIAL_ROOT / "Aerial.sqlite"
 AERIAL_BASE_DIR = AERIAL_ROOT / "Customer"
 AERIAL_VIDEO_DIR = AERIAL_BASE_DIR / "4KSDR240FPS"
 AERIAL_ENTRIES_JSON = AERIAL_BASE_DIR / "entries.json"
-DEFAULT_AERIAL_ID = "DAD82DCE-F3AE-4AEC-8A79-1694D412FC0A"  # Built-in Yosemite Aerial slot
+
+MODERN_AERIALS_ROOT = Path("/Library/Application Support/com.apple.wallpaper/aerials")
+MODERN_AERIALS_VIDEOS_DIR = MODERN_AERIALS_ROOT / "videos"
+MODERN_AERIALS_4K_DIR = MODERN_AERIALS_ROOT / "4KSDR240FPS"
+
+# CRITICAL: `4207734D-74FE-4F92-B5E1-6EC8DEE24A15` ("Golden Gate Sunset") is hardcoded inside
+# macOS's `WallpaperAerialsExtension` binary to ALWAYS play `/System/Library/Wallpapers/.default/Golden Gate.mov`
+# from the read-only system volume! Never use `4207734D-...` as the active Lock Screen choice.
+HARDCODED_GOLDEN_GATE_ID = "4207734D-74FE-4F92-B5E1-6EC8DEE24A15"
+
+# Instead, use "Tahoe Day" (`4C108785-A7BA-422E-9C79-B0129F1D5550`) as the primary active choice,
+# and also populate the top Landscape Aerial slots so whichever one the user clicks in System Settings works:
+PRIMARY_DEFAULT_ID = "4C108785-A7BA-422E-9C79-B0129F1D5550"  # Tahoe Day (first non-Golden Gate Landscape item)
+BUILTIN_SLOTS_TO_POPULATE = [
+    "4C108785-A7BA-422E-9C79-B0129F1D5550",  # Tahoe Day
+    "B2FC91ED-6891-4DEB-85A1-268B2B4160B6",  # Tahoe Morning
+    "F88CDF4A-9681-4D1F-88FE-34F1A3C6A62B",  # Sequoia Morning
+    "6D6834A4-2F0F-479A-B053-7D4DC5CB8EB7",  # Sequoia Sunrise
+    "FE876489-CBD5-479B-A8F0-1B67F0741CEA",  # Sonoma Horizon
+    "DAD82DCE-F3AE-4AEC-8A79-1694D412FC0A",  # Yosemite (Aerial.sqlite #1)
+    "E5799A24-1949-4E66-A17B-B5EB05F28C5D",  # Yosemite Representative
+    "86E89C23-C39B-44C8-A985-E56EEA6456FE",  # Golden Gate Night (non-hardcoded)
+]
+
 CACHE_DIR = Path(__file__).resolve().parent / ".wallpaper_cache"
 
 
@@ -395,21 +445,23 @@ def ensure_compiled_binary() -> Path:
     )
 
 
-def ensure_gif_converter_binary() -> Path:
-    """Compiles the native Swift ImageIO/AVFoundation GIF-to-MOV converter if not cached."""
+def ensure_media_converter_binary() -> Path:
+    """Compiles the native Swift ImageIO/AVFoundation media-to-MOV converter if not cached."""
     return compile_swift_helper(
-        "gif_to_mov",
-        SWIFT_GIF_CONVERTER_SOURCE,
+        "media_to_mov",
+        SWIFT_MEDIA_CONVERTER_SOURCE,
         ["Foundation", "ImageIO", "AVFoundation", "CoreVideo", "CoreGraphics"],
     )
 
 
-def convert_gif_to_mov(media_path: Path) -> Path:
+def prepare_lockscreen_mov(media_path: Path) -> Path:
     """
-    Converts a `.gif` into a `.mov` video inside CACHE_DIR using either `ffmpeg`
-    (if installed) or the native macOS ImageIO + AVFoundation Swift helper.
+    Ensures `media_path` (whether `.gif`, `.mp4`, `.m4v`, or `.mov`) is packaged as a
+    clean, un-quarantined QuickTime `.mov` inside CACHE_DIR so macOS's Lock Screen
+    (`WallpaperAerialsExtension` and `idleassetsd`) can decode it properly.
     """
-    if media_path.suffix.lower() != ".gif":
+    ext = media_path.suffix.lower()
+    if ext == ".mov":
         return media_path
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -420,17 +472,16 @@ def convert_gif_to_mov(media_path: Path) -> Path:
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
     if converted_mov.exists() and converted_mov.stat().st_size > 0:
-        print(f"[*] Using cached MOV conversion for GIF: {converted_mov.name}")
+        print(f"[*] Using cached QuickTime .mov for Lock Screen: {converted_mov.name}")
         return converted_mov
 
     ffmpeg_bin = shutil.which("ffmpeg")
     if ffmpeg_bin:
-        print(f"[*] Converting animated GIF '{media_path.name}' to MOV via ffmpeg...")
-        cmd = [
-            ffmpeg_bin,
-            "-y",
-            "-stream_loop",
-            "4",
+        print(f"[*] Converting '{media_path.name}' to QuickTime .mov via ffmpeg...")
+        cmd = [ffmpeg_bin, "-y"]
+        if ext == ".gif":
+            cmd.extend(["-stream_loop", "4"])
+        cmd.extend([
             "-i",
             str(media_path.resolve()),
             "-movflags",
@@ -440,24 +491,27 @@ def convert_gif_to_mov(media_path: Path) -> Path:
             "-vf",
             "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             str(converted_mov),
-        ]
+        ])
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode == 0 and converted_mov.exists():
-            print(f"[+] Converted GIF to {converted_mov}")
+            print(f"[+] Prepared QuickTime .mov: {converted_mov.name}")
             return converted_mov
 
-    converter_bin = ensure_gif_converter_binary()
-    print(f"[*] Converting animated GIF '{media_path.name}' to MOV via native macOS AVFoundation...")
+    converter_bin = ensure_media_converter_binary()
+    print(f"[*] Packaging '{media_path.name}' into QuickTime .mov via native AVFoundation...")
     result = subprocess.run(
         [str(converter_bin), str(media_path.resolve()), str(converted_mov)],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        print(f"[!] Failed to convert GIF to MOV:\n{result.stderr}", file=sys.stderr)
-        sys.exit(1)
+    if result.returncode != 0 or not converted_mov.exists():
+        if ext != ".gif":
+            shutil.copy2(media_path, converted_mov)
+        else:
+            print(f"[!] Failed to convert GIF to MOV:\n{result.stderr}", file=sys.stderr)
+            sys.exit(1)
 
-    print(f"[+] Converted GIF to {converted_mov}")
+    print(f"[+] Prepared QuickTime .mov: {converted_mov.name}")
     return converted_mov
 
 
@@ -471,7 +525,6 @@ def run_desktop_mode(video_path: Path, unmute: bool, fit: bool, foreground: bool
     binary_path = ensure_compiled_binary()
     stop_existing_desktop_player()
 
-    # If invoked via sudo, launch the GUI desktop window as the actual logged-in console user
     sudo_user = os.environ.get("SUDO_USER")
     cmd = []
     if os.geteuid() == 0 and sudo_user and sudo_user != "root":
@@ -509,29 +562,33 @@ def get_target_user_home() -> Path:
 
 
 def list_downloaded_aerials() -> list[tuple[str, Path]]:
-    """Finds downloaded macOS Aerial wallpaper `.mov` files on the system."""
-    if not AERIAL_VIDEO_DIR.exists():
-        return []
-    videos = sorted(AERIAL_VIDEO_DIR.glob("*.mov"), key=lambda p: p.stat().st_mtime, reverse=True)
-    name_map = {}
-    if AERIAL_ENTRIES_JSON.exists():
-        try:
-            data = json.loads(AERIAL_ENTRIES_JSON.read_text(encoding="utf-8"))
-            for asset in data.get("assets", []):
-                asset_id = asset.get("id")
-                label = asset.get("accessibilityLabel") or asset.get("localizedNameKey") or asset_id
-                if asset_id:
-                    name_map[f"{asset_id}.mov"] = label
-        except Exception:
-            pass
-
-    return [(name_map.get(v.name, "Downloaded Aerial Video"), v) for v in videos]
+    """Finds downloaded macOS Aerial wallpaper `.mov` files across both legacy and modern paths."""
+    found = []
+    seen = set()
+    user_home = get_target_user_home()
+    user_aerials_dir = user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "aerials"
+    search_dirs = [
+        AERIAL_VIDEO_DIR,
+        MODERN_AERIALS_VIDEOS_DIR,
+        MODERN_AERIALS_4K_DIR,
+        MODERN_AERIALS_ROOT,
+        user_aerials_dir / "videos",
+        user_aerials_dir / "4KSDR240FPS",
+        user_aerials_dir,
+    ]
+    for d in search_dirs:
+        if d.exists():
+            for v in sorted(d.glob("*.mov"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if v.name not in seen:
+                    seen.add(v.name)
+                    found.append(("Installed Aerial Slot", v))
+    return found
 
 
 def build_aerial_wallpaper_choice_node(asset_id: str) -> dict:
     """
     Constructs the `Index.plist` dictionary structure that instructs macOS's
-    `WallpaperAgent` and Lock Screen (`idleassetsd`) to play `asset_id`.
+    `WallpaperAgent`, `WallpaperAerialsExtension`, and `idleassetsd` to play `asset_id`.
     """
     config_plist = plistlib.dumps({"assetID": asset_id}, fmt=plistlib.FMT_BINARY)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
@@ -544,7 +601,7 @@ def build_aerial_wallpaper_choice_node(asset_id: str) -> dict:
                     "Provider": "com.apple.wallpaper.choice.aerials",
                 }
             ],
-            " EncodedOptionValues": "$null",
+            "EncodedOptionValues": "$null",
             "Shuffle": "$null",
         },
         "LastSet": now,
@@ -552,29 +609,59 @@ def build_aerial_wallpaper_choice_node(asset_id: str) -> dict:
     }
 
 
-def activate_aerial_in_user_index_plist(asset_id: str):
+def activate_aerial_in_user_index_plist(asset_id: str) -> list[str]:
     """
     Updates `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist`
-    so both the Lock Screen (`Idle`) and Desktop (`SystemDefault` / `AllSpacesAndDisplays`)
-    actively use the target Aerial `asset_id` immediately without requiring the user
-    to manually open System Settings > Wallpaper.
+    to switch away from the hardcoded Golden Gate Sunset ID (`4207734D-74FE-4F92-B5E1-6EC8DEE24A15`)
+    and use `asset_id` (`4C108785-A7BA-422E-9C79-B0129F1D5550` - Tahoe Day) instead.
     """
     user_home = get_target_user_home()
     store_dir = user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "Store"
     index_plist = store_dir / "Index.plist"
 
+    discovered_ids: list[str] = []
     if not index_plist.exists():
-        print(f"[!] Note: {index_plist} not found; you may need to select the Aerial wallpaper in System Settings > Wallpaper.")
-        return
+        return discovered_ids
 
     backup_plist = store_dir / "Index.plist.bak"
     if not backup_plist.exists():
         shutil.copy2(index_plist, backup_plist)
 
+    def scan_and_patch_choices(obj):
+        if isinstance(obj, dict):
+            if "Choices" in obj and isinstance(obj["Choices"], list):
+                for choice in obj["Choices"]:
+                    if isinstance(choice, dict):
+                        cfg_bytes = choice.get("Configuration")
+                        if isinstance(cfg_bytes, (bytes, bytearray)) and len(cfg_bytes) > 0:
+                            try:
+                                cfg = plistlib.loads(cfg_bytes)
+                                if isinstance(cfg, dict) and "assetID" in cfg:
+                                    aid = str(cfg["assetID"]).strip()
+                                    if aid and aid != HARDCODED_GOLDEN_GATE_ID and aid not in discovered_ids:
+                                        discovered_ids.append(aid)
+                            except Exception:
+                                pass
+                        # Point this choice directly to our custom Aerial asset_id
+                        choice["Provider"] = "com.apple.wallpaper.choice.aerials"
+                        choice["Configuration"] = plistlib.dumps({"assetID": asset_id}, fmt=plistlib.FMT_BINARY)
+                        choice["Files"] = []
+            for k, v in list(obj.items()):
+                # Clean up any legacy typo key if present
+                if k == " EncodedOptionValues":
+                    del obj[k]
+                    obj["EncodedOptionValues"] = "$null"
+                else:
+                    scan_and_patch_choices(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                scan_and_patch_choices(item)
+
     try:
         with index_plist.open("rb") as f:
             plist_data = plistlib.load(f)
 
+        scan_and_patch_choices(plist_data)
         choice_node = build_aerial_wallpaper_choice_node(asset_id)
 
         for top_key in ("AllSpacesAndDisplays", "SystemDefault"):
@@ -606,91 +693,184 @@ def activate_aerial_in_user_index_plist(asset_id: str):
         with index_plist.open("wb") as f:
             plistlib.dump(plist_data, f, fmt=plistlib.FMT_BINARY)
 
-        # Preserve original ownership if running under sudo
         sudo_uid = os.environ.get("SUDO_UID")
         sudo_gid = os.environ.get("SUDO_GID")
         if sudo_uid and sudo_gid:
             os.chown(index_plist, int(sudo_uid), int(sudo_gid))
 
-        print(f"[+] Updated Lock Screen & Wallpaper configuration in {index_plist.name} (Asset ID: {asset_id})")
+        print(f"[+] Updated Index.plist to use non-hardcoded Aerial slot: {asset_id} (Tahoe Day)")
     except Exception as exc:
-        print(f"[!] Warning: Could not automatically update Index.plist ({exc}).")
+        print(f"[!] Warning: Could not update Index.plist ({exc}).")
+
+    return discovered_ids
 
 
-def mark_aerial_downloaded_in_sqlite(asset_id: str):
+def mark_aerials_downloaded_in_sqlite(asset_ids: list[str]):
     """
-    Marks `asset_id` as downloaded (`ZLASTDOWNLOADED`) in `/Library/Application Support/com.apple.idleassetsd/Aerial.sqlite`
-    so `idleassetsd` recognizes the `.mov` file immediately even if no Aerials were previously downloaded.
+    Marks all target `asset_ids` as downloaded (`ZLASTDOWNLOADED`) in
+    `/Library/Application Support/com.apple.idleassetsd/Aerial.sqlite`.
     """
     if not AERIAL_SQLITE.exists():
         return
     try:
-        # CoreData timestamp epoch is 2001-01-01 00:00:00 UTC (978307200 seconds after Unix epoch)
         coredata_now = (datetime.datetime.now(datetime.timezone.utc).timestamp()) - 978307200.0
         conn = sqlite3.connect(str(AERIAL_SQLITE))
         with conn:
-            conn.execute(
-                "UPDATE ZASSET SET ZLASTDOWNLOADED = ? WHERE ZIDENTIFIER = ?",
-                (coredata_now, asset_id),
-            )
+            for aid in asset_ids:
+                conn.execute(
+                    "UPDATE ZASSET SET ZLASTDOWNLOADED = ? WHERE ZIDENTIFIER = ?",
+                    (coredata_now, aid),
+                )
         conn.close()
-        print(f"[+] Registered asset {asset_id} as downloaded in Aerial.sqlite")
+        print(f"[+] Marked {len(asset_ids)} Aerial slots as downloaded in Aerial.sqlite")
     except Exception as exc:
         print(f"[!] Warning: Could not update Aerial.sqlite ({exc})")
 
 
+def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: int = 80):
+    """Copies `src_mov` to `dst_mov`, backing up any original file and stripping quarantine xattrs."""
+    dst_mov.parent.mkdir(parents=True, exist_ok=True)
+    if dst_mov.exists():
+        backup_file = dst_mov.with_suffix(".mov.bak")
+        if not backup_file.exists():
+            shutil.copy2(dst_mov, backup_file)
+
+    shutil.copy2(src_mov, dst_mov)
+    os.chmod(dst_mov, 0o644)
+    try:
+        os.chown(dst_mov, uid, gid)
+    except Exception:
+        pass
+    subprocess.run(["xattr", "-c", str(dst_mov)], stderr=subprocess.DEVNULL)
+
+
 def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     """
-    Installs the user's video or converted GIF into macOS's Lock Screen Aerial cache,
-    marks it downloaded in `Aerial.sqlite`, and activates it in `Index.plist`.
+    Converts/remuxes the user's video or GIF into a clean QuickTime `.mov` and installs it
+    into non-hardcoded Aerial slots (defaulting to `4C108785-A7BA-422E-9C79-B0129F1D5550` Tahoe Day)
+    across all system and user Lock Screen video directories.
     """
-    # Convert GIF to MOV BEFORE elevating to sudo so AVFoundation hardware encoders run in the user's session
-    playable_path = convert_gif_to_mov(video_path)
+    playable_mov = prepare_lockscreen_mov(video_path)
 
     if os.geteuid() != 0:
         print("[*] Elevating privileges with sudo to install Lock Screen wallpaper...")
-        cmd = ["sudo", sys.executable, str(Path(__file__).resolve()), str(playable_path), "--mode", "lockscreen"]
+        cmd = ["sudo", sys.executable, str(Path(__file__).resolve()), str(playable_mov), "--mode", "lockscreen"]
         if target_id:
             cmd.extend(["--target-id", target_id])
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 
-    AERIAL_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
-    downloaded = list_downloaded_aerials()
-
     if target_id:
-        clean_id = target_id[:-4] if target_id.endswith(".mov") else target_id
-        target_file = AERIAL_VIDEO_DIR / f"{clean_id}.mov"
-    elif downloaded:
-        label, target_file = downloaded[0]
-        clean_id = target_file.stem
-        print(f"[*] Using existing downloaded Aerial wallpaper slot: {label} ({target_file.name})")
+        clean_target = target_id[:-4] if target_id.endswith(".mov") else target_id
+        if clean_target.upper() == HARDCODED_GOLDEN_GATE_ID:
+            print(f"[!] Note: {HARDCODED_GOLDEN_GATE_ID} (Golden Gate Sunset) is hardcoded by macOS to play from the read-only system volume.")
+            print(f"    Switching automatically to {PRIMARY_DEFAULT_ID} (Tahoe Day) so your custom video loads!")
+            primary_id = PRIMARY_DEFAULT_ID
+        else:
+            primary_id = clean_target
     else:
-        # Zero Aerials were previously downloaded on this Mac! Bootstrap the built-in Yosemite slot automatically.
-        clean_id = DEFAULT_AERIAL_ID
-        target_file = AERIAL_VIDEO_DIR / f"{clean_id}.mov"
-        print(f"[*] No previously downloaded Aerials found; bootstrapping built-in slot {clean_id}.mov...")
+        primary_id = PRIMARY_DEFAULT_ID
 
-    if target_file.exists():
-        backup_file = target_file.with_suffix(".mov.bak")
-        if not backup_file.exists():
-            print(f"[*] Backing up original Apple video to {backup_file.name}...")
-            shutil.copy2(target_file, backup_file)
+    # 1. Stop WallpaperAgent / WallpaperAerialsExtension BEFORE editing Index.plist so they don't overwrite our changes
+    for daemon in [
+        "WallpaperAerialsExtension",
+        "WallpaperVideoExtension",
+        "WallpaperAgent",
+        "idleassetsd",
+        "NeptuneOneWallpaper",
+    ]:
+        subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
-    print(f"[*] Installing '{video_path.name}' into {target_file}...")
-    shutil.copy2(playable_path, target_file)
-    os.chmod(target_file, 0o644)
-    os.chown(target_file, 0, 80)  # root:admin
+    # 2. Update Index.plist to use primary_id (Tahoe Day) instead of Golden Gate Sunset
+    discovered_ids = activate_aerial_in_user_index_plist(primary_id)
 
-    mark_aerial_downloaded_in_sqlite(clean_id)
-    activate_aerial_in_user_index_plist(clean_id)
+    # 3. Collect all target Asset IDs to populate
+    target_ids = []
+    for aid in [primary_id] + BUILTIN_SLOTS_TO_POPULATE + discovered_ids:
+        if aid and aid not in target_ids:
+            target_ids.append(aid)
 
-    # Restart macOS wallpaper and Lock Screen idle assets daemons so changes take effect immediately
-    for daemon in ["WallpaperAgent", "WallpaperVideoExtension", "idleassetsd", "cfprefsd"]:
-        subprocess.run(["killall", daemon], stderr=subprocess.DEVNULL)
+    for _, existing_path in list_downloaded_aerials():
+        stem = existing_path.stem
+        if stem not in target_ids and stem != HARDCODED_GOLDEN_GATE_ID:
+            target_ids.append(stem)
 
-    print("[+] Success! Your custom video/GIF is now active on the macOS Lock Screen.")
-    print(f"    To restore your previous Lock Screen settings later, run:\n    sudo python3 {Path(__file__).resolve()} --restore-lockscreen")
+    # 4. Install the .mov into system, user Application Support, and user Container Lock Screen Aerial directories
+    user_home = get_target_user_home()
+    sudo_uid = int(os.environ.get("SUDO_UID", 0))
+    sudo_gid = int(os.environ.get("SUDO_GID", 80))
+
+    user_app_support_aerials = (
+        user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "aerials"
+    )
+    user_container_aerials = (
+        user_home
+        / "Library"
+        / "Containers"
+        / "com.apple.wallpaper.extension.aerials"
+        / "Data"
+        / "Library"
+        / "Application Support"
+        / "com.apple.wallpaper"
+        / "aerials"
+    )
+
+    system_dirs = [
+        AERIAL_VIDEO_DIR,
+        MODERN_AERIALS_ROOT,
+        MODERN_AERIALS_VIDEOS_DIR,
+        MODERN_AERIALS_4K_DIR,
+    ]
+    user_dirs = [
+        user_app_support_aerials,
+        user_app_support_aerials / "videos",
+        user_app_support_aerials / "4KSDR240FPS",
+    ]
+    if user_container_aerials.parent.exists():
+        user_dirs.extend([
+            user_container_aerials,
+            user_container_aerials / "videos",
+            user_container_aerials / "4KSDR240FPS",
+        ])
+
+    installed_count = 0
+    for d in system_dirs:
+        try:
+            for aid in target_ids:
+                install_mov_to_destination(playable_mov, d / f"{aid}.mov", uid=0, gid=80)
+                installed_count += 1
+        except Exception:
+            pass
+
+    for d in user_dirs:
+        try:
+            for aid in target_ids:
+                install_mov_to_destination(playable_mov, d / f"{aid}.mov", uid=sudo_uid, gid=sudo_gid)
+                installed_count += 1
+        except Exception:
+            pass
+
+    print(f"[+] Installed QuickTime .mov into {len(target_ids)} Aerial slots across system & user directories ({installed_count} files).")
+
+    # 5. Update Aerial.sqlite timestamps
+    mark_aerials_downloaded_in_sqlite(target_ids)
+
+    # 6. Restart wallpaper & preference daemons so the new Index.plist and video slots load cleanly
+    for daemon in [
+        "cfprefsd",
+        "WallpaperAerialsExtension",
+        "WallpaperVideoExtension",
+        "WallpaperAgent",
+        "idleassetsd",
+        "NeptuneOneWallpaper",
+    ]:
+        subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
+
+    print("\n[+] Success! Your custom video/GIF is now installed for the macOS Lock Screen.")
+    print("    IMPORTANT: Because macOS hardcodes 'Golden Gate Sunset' to the read-only system bridge video,")
+    print("    if you still see the orange bridge, open System Settings > Wallpaper and click 'Tahoe Day'")
+    print("    (right next to Golden Gate Sunset under Landscape) or 'Sequoia Morning' / 'Yosemite' —")
+    print("    all of those slots now contain your custom video and will play it immediately on the Lock Screen!")
 
 
 def restore_lockscreen_aerials():
@@ -699,20 +879,57 @@ def restore_lockscreen_aerials():
         subprocess.run(["sudo", sys.executable, str(Path(__file__).resolve()), "--restore-lockscreen"])
         return
 
-    if AERIAL_VIDEO_DIR.exists():
-        for bak in AERIAL_VIDEO_DIR.glob("*.mov.bak"):
-            orig = bak.with_suffix("")  # strips .bak, leaving .mov
-            print(f"[*] Restoring {orig.name} from backup...")
+    user_home = get_target_user_home()
+    user_app_support_aerials = (
+        user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "aerials"
+    )
+    user_container_aerials = (
+        user_home
+        / "Library"
+        / "Containers"
+        / "com.apple.wallpaper.extension.aerials"
+        / "Data"
+        / "Library"
+        / "Application Support"
+        / "com.apple.wallpaper"
+        / "aerials"
+    )
+
+    candidate_dirs = [
+        AERIAL_VIDEO_DIR,
+        MODERN_AERIALS_ROOT,
+        MODERN_AERIALS_VIDEOS_DIR,
+        MODERN_AERIALS_4K_DIR,
+        user_app_support_aerials,
+        user_app_support_aerials / "videos",
+        user_app_support_aerials / "4KSDR240FPS",
+        user_container_aerials,
+        user_container_aerials / "videos",
+        user_container_aerials / "4KSDR240FPS",
+    ]
+
+    for daemon in [
+        "WallpaperAerialsExtension",
+        "WallpaperVideoExtension",
+        "WallpaperAgent",
+        "idleassetsd",
+        "NeptuneOneWallpaper",
+    ]:
+        subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
+
+    for d in candidate_dirs:
+        if not d.exists():
+            continue
+        for bak in d.glob("*.mov.bak"):
+            orig = bak.with_suffix("")
+            print(f"[*] Restoring {orig} from backup...")
             shutil.move(str(bak), str(orig))
             os.chmod(orig, 0o644)
+        for slot_id in BUILTIN_SLOTS_TO_POPULATE + [HARDCODED_GOLDEN_GATE_ID]:
+            bootstrapped = d / f"{slot_id}.mov"
+            if bootstrapped.exists() and not bootstrapped.with_suffix(".mov.bak").exists():
+                bootstrapped.unlink(missing_ok=True)
 
-        # If we bootstrapped DEFAULT_AERIAL_ID without a prior backup, remove our injected file
-        bootstrapped = AERIAL_VIDEO_DIR / f"{DEFAULT_AERIAL_ID}.mov"
-        if bootstrapped.exists() and not bootstrapped.with_suffix(".mov.bak").exists():
-            print(f"[*] Removing bootstrapped Lock Screen file {bootstrapped.name}...")
-            bootstrapped.unlink(missing_ok=True)
-
-    user_home = get_target_user_home()
     store_dir = user_home / "Library" / "Application Support" / "com.apple.wallpaper" / "Store"
     backup_plist = store_dir / "Index.plist.bak"
     index_plist = store_dir / "Index.plist"
@@ -720,8 +937,15 @@ def restore_lockscreen_aerials():
         print("[*] Restoring original Index.plist wallpaper configuration...")
         shutil.move(str(backup_plist), str(index_plist))
 
-    for daemon in ["WallpaperAgent", "WallpaperVideoExtension", "idleassetsd", "cfprefsd"]:
-        subprocess.run(["killall", daemon], stderr=subprocess.DEVNULL)
+    for daemon in [
+        "cfprefsd",
+        "WallpaperAerialsExtension",
+        "WallpaperVideoExtension",
+        "WallpaperAgent",
+        "idleassetsd",
+        "NeptuneOneWallpaper",
+    ]:
+        subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
     print("[+] Original Lock Screen settings restored.")
 
@@ -794,10 +1018,9 @@ def main():
     if args.list_lockscreen_slots:
         slots = list_downloaded_aerials()
         if not slots:
-            print("No downloaded Aerial wallpapers found in /Library/Application Support/com.apple.idleassetsd/Customer/4KSDR240FPS")
-            print(f"Note: Running with --mode lockscreen or --mode both will automatically bootstrap slot {DEFAULT_AERIAL_ID} for you.")
+            print("No custom/downloaded Aerial wallpapers found yet.")
         else:
-            print("Downloaded Aerial Wallpaper Slots:")
+            print("Installed Aerial Wallpaper Slots:")
             for label, path in slots:
                 print(f"  - {label}: {path.name} ({path})")
         return
