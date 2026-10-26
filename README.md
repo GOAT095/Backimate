@@ -34,7 +34,7 @@ Most macOS live wallpaper tools only work on the Desktop, require heavy third-pa
 ```bash
 git clone https://github.com/yourusername/Backimate.git
 cd Backimate
-chmod +x mac_video_wallpaper.py
+chmod +x backimate.py
 ```
 
 *(Prerequisite: macOS 14 Sonoma, macOS 15 Sequoia, or macOS 26/27 Tahoe with Xcode Command Line Tools installed. If you don't have Command Line Tools yet, run `xcode-select --install`.)*
@@ -42,13 +42,13 @@ chmod +x mac_video_wallpaper.py
 ### 2. Set a Video or GIF on Both Desktop & Lock Screen (Default)
 
 ```bash
-sudo python3 mac_video_wallpaper.py /path/to/your/video_or_animation.mp4
+sudo python3 backimate.py /path/to/your/video_or_animation.mp4
 ```
 
 Or with an animated `.gif`:
 
 ```bash
-sudo python3 mac_video_wallpaper.py /path/to/your/animation.gif
+sudo python3 backimate.py /path/to/your/animation.gif
 ```
 
 > **💡 Lock Screen Tip:** Because macOS hardcodes **Golden Gate Sunset** to the read-only system bridge video, open **System Settings > Wallpaper** once, make sure **Show as screen saver** is enabled, and click **Tahoe Day** (right next to Golden Gate Sunset under *Landscape*), **Sequoia**, or **Yosemite**. Backimate pre-populates all of those slots with your custom video so it plays immediately when you lock your screen (`Ctrl + Cmd + Q`).
@@ -58,7 +58,7 @@ sudo python3 mac_video_wallpaper.py /path/to/your/animation.gif
 ## 🛠️ Usage & CLI Options
 
 ```text
-usage: mac_video_wallpaper.py [-h] [--mode {both,desktop,lockscreen}]
+usage: backimate.py [-h] [--mode {both,desktop,lockscreen}]
                               [--target-id TARGET_ID] [--unmute] [--fit]
                               [--foreground] [--stop]
                               [--list-lockscreen-slots] [--restore-lockscreen]
@@ -67,15 +67,15 @@ usage: mac_video_wallpaper.py [-h] [--mode {both,desktop,lockscreen}]
 
 | Command / Flag | Description | Requires `sudo`? |
 | :--- | :--- | :---: |
-| `python3 mac_video_wallpaper.py file.mp4 --mode desktop` | Play video or `.gif` on the Desktop background only (behind desktop icons, across all Spaces and monitors). | No |
-| `sudo python3 mac_video_wallpaper.py file.mp4` | Apply to **both** the Desktop background and the macOS Lock Screen (`--mode both` is default). | Yes |
-| `sudo python3 mac_video_wallpaper.py file.mp4 --mode lockscreen` | Install video or `.gif` into the native macOS Lock Screen Aerial engine only. | Yes |
+| `python3 backimate.py file.mp4 --mode desktop` | Play video or `.gif` on the Desktop background only (behind desktop icons, across all Spaces and monitors). | No |
+| `sudo python3 backimate.py file.mp4` | Apply to **both** the Desktop background and the macOS Lock Screen (`--mode both` is default). | Yes |
+| `sudo python3 backimate.py file.mp4 --mode lockscreen` | Install video or `.gif` into the native macOS Lock Screen Aerial engine only. | Yes |
 | `--unmute` | Enable audio playback in Desktop mode (muted by default). | No |
 | `--fit` | Letterbox/fit the video or GIF inside screen bounds instead of aspect-filling the screen. | No |
 | `--foreground` | Keep the Desktop player attached to your terminal window (`Ctrl+C` to stop) instead of daemonizing in the background. | No |
-| `python3 mac_video_wallpaper.py --stop` | Stop the running background Desktop video/GIF wallpaper process. | No |
-| `python3 mac_video_wallpaper.py --list-lockscreen-slots` | List all installed/downloaded macOS Aerial `.mov` slots on your Mac. | No |
-| `sudo python3 mac_video_wallpaper.py --restore-lockscreen` | Restore original Apple Aerial videos and your original `Index.plist` Lock Screen configuration from backup. | Yes |
+| `python3 backimate.py --stop` | Stop the running background Desktop video/GIF wallpaper process. | No |
+| `python3 backimate.py --list-lockscreen-slots` | List all installed/downloaded macOS Aerial `.mov` slots on your Mac. | No |
+| `sudo python3 backimate.py --restore-lockscreen` | Restore original Apple Aerial videos and your original `Index.plist` Lock Screen configuration from backup. | Yes |
 
 ---
 
