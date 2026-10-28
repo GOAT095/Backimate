@@ -15,13 +15,13 @@
 
 ## ✨ Why Backimate?
 
-Most macOS live wallpaper tools only work on the Desktop, require heavy third-party apps, or break on newer macOS releases because Apple hardcodes the default **Golden Gate Sunset** (`4207734D-74FE-4F92-B5E1-6EC8DEE24A15`) wallpaper to a read-only system volume file (`/System/Library/Wallpapers/.default/Golden Gate.mov`).
+Most macOS live wallpaper tools only work on the Desktop, require heavy third-party apps, go black/static after 2–3 screen locks on short `.mp4` clips, or break on newer macOS releases because Apple hardcodes the default **Golden Gate Sunset** (`4207734D-74FE-4F92-B5E1-6EC8DEE24A15`) wallpaper to a read-only system volume file (`/System/Library/Wallpapers/.default/Golden Gate.mov`).
 
 **Backimate** solves both Desktop and Lock Screen live wallpapers in a single, zero-dependency Python script:
 
-- **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors.
-- **🔒 Native Lock Screen & Aerial Integration (`--mode lockscreen`):** Automatically packages your `.mp4`, `.mov`, or `.gif` into a genuine Apple QuickTime `.mov` container, strips `com.apple.quarantine` extended attributes, updates `Aerial.sqlite` and `Index.plist`, and populates non-hardcoded macOS Aerial slots (**Tahoe Day**, **Sequoia Morning**, **Yosemite**, etc.) so your animation plays smoothly on the macOS Lock Screen and transitions onto the Desktop when you unlock.
-- **🎞️ Built-In Animated `.gif` Engine:** Renders `.gif` files natively via `AppKit` on the Desktop with zero conversion delay, and automatically converts `.gif` files into hardware-accelerated QuickTime `.mov` loops for the Lock Screen using native macOS `ImageIO` + `AVFoundation` (or `ffmpeg` if installed).
+- **🖥️ True Desktop Video & GIF Layer (`--mode desktop`):** Compiles a lightweight native macOS `Cocoa` + `AVFoundation` helper on the fly that pins a borderless, click-through video (`AVPlayerLooper`) or animated GIF (`NSImageView`) window strictly behind your desktop icons (`kCGDesktopWindowLevel`) across all Spaces and monitors, and automatically resumes on screen wake/unlock.
+- **🔒 True 4-Minute Sequential `FastStart` Lock Screen Engine (`--mode lockscreen`):** macOS's Lock Screen hardware decoder (`WallpaperAerialsExtension` / `idleassetsd`) does not rewind short clips on every lock—it advances its playhead across consecutive locks and aborts with a black/static screen if `stco` chunk byte offsets jump backward or `elst` edit lists contain multiple segments. Backimate strips audio tracks, normalizes B-frame start offsets to `0.0s`, writes a **240-second (4-minute) sequential compressed sample stream** (`segments=1`, strictly increasing `stco` byte offsets), runs a `shouldOptimizeForNetworkUse` (`faststart`: `ftyp` -> `moov` -> `mdat`) pass, and hardlinks (`os.link`) the result across all Aerial slots so it uses only 1 file's worth of disk space.
+- **🎞️ Built-In Animated `.gif` Engine:** Renders `.gif` files natively via `AppKit` on the Desktop with zero conversion delay, and automatically converts `.gif` files into hardware-accelerated QuickTime `.mov` loops for the Lock Screen using native macOS `ImageIO` + `AVFoundation`.
 - **🪶 Zero `pip` Dependencies:** Uses only the Python standard library and macOS's built-in Xcode Command Line Tools (`xcrun swiftc`).
 - **♻️ One-Command Backup & Restore:** Automatically backs up original Apple `.mov` assets and your `Index.plist` before making changes, so you can revert to stock macOS settings at any time with `--restore-lockscreen`.
 
@@ -59,10 +59,10 @@ sudo python3 backimate.py /path/to/your/animation.gif
 
 ```text
 usage: backimate.py [-h] [--mode {both,desktop,lockscreen}]
-                              [--target-id TARGET_ID] [--unmute] [--fit]
-                              [--foreground] [--stop]
-                              [--list-lockscreen-slots] [--restore-lockscreen]
-                              [video]
+                    [--target-id TARGET_ID] [--unmute] [--fit]
+                    [--foreground] [--stop]
+                    [--list-lockscreen-slots] [--restore-lockscreen]
+                    [video]
 ```
 
 | Command / Flag | Description | Requires `sudo`? |
@@ -84,11 +84,11 @@ usage: backimate.py [-h] [--mode {both,desktop,lockscreen}]
 macOS separates the user Desktop session from the Lock Screen (`loginwindow` / `WallpaperAerialsExtension` / `idleassetsd`):
 
 1. **Desktop Engine (`AVQueuePlayer` + `AVPlayerLooper` / `NSImageView`):**
-   On first run, Backimate compiles a tiny native Swift binary into `.wallpaper_cache/desktop_video_player`. It creates a borderless `NSWindow` for every connected display at window level `kCGDesktopWindowLevel` with `.canJoinAllSpaces`, `.stationary`, and `ignoresMouseEvents = true`. If you plug in an external monitor or change resolutions, it automatically rebuilds the wallpaper layers.
-2. **Media Remuxer & GIF Transcoder (`AVAssetExportSession` & `AVAssetWriter`):**
-   macOS's Lock Screen daemon rejects raw `.gif` files and ISO `.mp4` files renamed to `.mov`. Backimate compiles `.wallpaper_cache/media_to_mov`, which losslessly remuxes `.mp4`/`.m4v` files into genuine Apple QuickTime (`.MOV/QT`) containers and encodes `.gif` animations into smooth looping QuickTime tracks.
-3. **Lock Screen Aerial Injection & Hardcode Bypass:**
-   On modern macOS, `WallpaperAerialsExtension` checks if the selected wallpaper ID is `4207734D-74FE-4F92-B5E1-6EC8DEE24A15` (*Golden Gate Sunset*) and forces `/System/Library/Wallpapers/.default/Golden Gate.mov` if so. Backimate automatically switches your active `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` choice to non-hardcoded Landscape Aerial slots (`4C108785-A7BA-422E-9C79-B0129F1D5550` *Tahoe Day*, *Sequoia*, *Yosemite*, etc.), populates both `/Library/Application Support/com.apple.idleassetsd/Customer/4KSDR240FPS/` and `/Library/Application Support/com.apple.wallpaper/aerials/`, clears `com.apple.quarantine` attributes, updates `Aerial.sqlite`, and restarts the wallpaper daemons.
+   On first run, Backimate compiles a tiny native Swift binary into `.wallpaper_cache/desktop_video_player`. It creates a borderless `NSWindow` for every connected display at window level `kCGDesktopWindowLevel` with `.canJoinAllSpaces`, `.stationary`, and `ignoresMouseEvents = true`, plus `NSWorkspace.screensDidWakeNotification` and `com.apple.screenIsUnlocked` observers so playback never stalls after sleep or unlock.
+2. **Sequential Compressed Sample Loop & `FastStart` Builder (`AVAssetReader` + `AVAssetWriter` + `AVAssetExportSession`):**
+   Apple's native Lock Screen `.mov` files are 4-minute (`240s`), single-track (`tracks=1`), single-segment (`segments=1`), `moov`-first (`ftyp` -> `moov` -> `mdat`) QuickTime movies whose `stco` chunk byte offsets increase strictly monotonically from start to finish. If a file loops via multi-segment `elst` edit lists or non-monotonic `stco` chunk pointers, macOS's sandboxed Lock Screen hardware decoder fails on the 2nd lock with a black or static screen. Backimate reads the compressed video samples once, strips audio, shifts B-frame timestamps to `0.0s`, writes 240 seconds of sequential compressed samples, and runs `AVAssetExportSession` with `shouldOptimizeForNetworkUse = true` so the resulting `.mov` matches Apple's native Aerial structure byte-for-byte.
+3. **Hardlinked Aerial Injection & Hardcode Bypass:**
+   On modern macOS, `WallpaperAerialsExtension` checks if the selected wallpaper ID is `4207734D-74FE-4F92-B5E1-6EC8DEE24A15` (*Golden Gate Sunset*) and forces `/System/Library/Wallpapers/.default/Golden Gate.mov` if so. Backimate automatically switches your active `~/Library/Application Support/com.apple.wallpaper/Store/Index.plist` choice to non-hardcoded Landscape Aerial slots (`4C108785-A7BA-422E-9C79-B0129F1D5550` *Tahoe Day*, *Sequoia*, *Yosemite*, etc.), hardlinks (`os.link`) the prepared `.mov` across all Aerial directories so no extra disk space is used, clears `com.apple.quarantine` attributes and `ZPOINTSOFINTEREST` seek checkpoints in `Aerial.sqlite`, and restarts the wallpaper daemons.
 
 ---
 

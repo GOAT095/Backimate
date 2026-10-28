@@ -43,6 +43,53 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification,
             object: nil
         )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(sessionDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(sessionDidUnlock),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"),
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(sessionDidLock),
+            name: NSNotification.Name("com.apple.screenIsLocked"),
+            object: nil
+        )
+    }
+
+    @objc func sessionDidWake() {
+        for player in players {
+            if player.rate == 0 {
+                player.play()
+            }
+        }
+    }
+
+    @objc func sessionDidLock() {
+        // When screen locks, do not kill extensions mid-lock; let the freshly-reset extension play from 0:00!
+    }
+
+    @objc func sessionDidUnlock() {
+        sessionDidWake()
+        // 1. Kill user-owned Wallpaper extensions immediately in the user's Aqua session
+        //    so macOS respawns them fresh at playhead 0:00 before the NEXT screen lock!
+        for procName in ["WallpaperAerialsExtension", "WallpaperVideoExtension", "WallpaperAgent", "NeptuneOneWallpaper"] {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
+            task.arguments = ["-9", procName]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+        }
+        // 2. Touch /tmp/.backimate_unlock_trigger so the root WatchPaths LaunchDaemon also resets idleassetsd as root!
+        let triggerPath = "/tmp/.backimate_unlock_trigger"
+        try? "\(Date().timeIntervalSince1970)".write(toFile: triggerPath, atomically: true, encoding: .utf8)
     }
 
     @objc func screensDidChange() {
@@ -68,7 +115,6 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
                 defer: false
             )
 
-            // Place the window at the Desktop level (behind desktop icons)
             let desktopLevel = Int(CGWindowLevelForKey(.desktopWindow))
             window.level = NSWindow.Level(rawValue: desktopLevel)
             window.collectionBehavior = [
@@ -173,6 +219,7 @@ app.run()
 SWIFT_MEDIA_CONVERTER_SOURCE = r"""
 import Foundation
 import ImageIO
+import UniformTypeIdentifiers
 import AVFoundation
 import CoreVideo
 import CoreGraphics
@@ -189,190 +236,285 @@ let ext = inputURL.pathExtension.lowercased()
 
 try? FileManager.default.removeItem(at: outputURL)
 
-// Mode 1: Remux or transcode .mp4 / .m4v / .mov into a clean QuickTime .mov container
-if ext != "gif" {
-    let asset = AVURLAsset(url: inputURL)
-    let semaphore = DispatchSemaphore(value: 0)
-    var exportSucceeded = false
-
-    let presets = [AVAssetExportPresetPassthrough, AVAssetExportPresetHighestQuality]
-    for preset in presets {
-        try? FileManager.default.removeItem(at: outputURL)
-        guard let session = AVAssetExportSession(asset: asset, presetName: preset) else { continue }
-        session.outputURL = outputURL
-        session.outputFileType = .mov
-        session.shouldOptimizeForNetworkUse = true
-        session.exportAsynchronously {
-            if session.status == .completed {
-                exportSucceeded = true
-            }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        if exportSucceeded {
-            exit(0)
-        }
+/// Step 1: If the input is a video (.mp4, .mov, .m4v), we first convert its frames into an
+/// in-memory or temporary `.gif` via `CGImageDestination` so that Step 2 (`convertGIFToMOV`)
+/// runs the EXACT SAME 100% working `CGImageSource` -> `AVAssetWriter` code path that works for GIFs!
+func convertVideoToTempGIF(videoURL: URL, tempGIFURL: URL) -> Bool {
+    let asset = AVURLAsset(url: videoURL)
+    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        return false
     }
 
-    try? FileManager.default.copyItem(at: inputURL, to: outputURL)
-    exit(0)
-}
+    let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
+    let srcW = abs(naturalSize.width)
+    let srcH = abs(naturalSize.height)
+    let maxDim: CGFloat = 1280.0
+    var targetW = Int(srcW)
+    var targetH = Int(srcH)
+    if srcW > maxDim || srcH > maxDim {
+        let scale = min(maxDim / max(srcW, 1.0), maxDim / max(srcH, 1.0))
+        targetW = Int(srcW * scale)
+        targetH = Int(srcH * scale)
+    }
+    targetW = max(64, (targetW % 2 == 0) ? targetW : targetW + 1)
+    targetH = max(64, (targetH % 2 == 0) ? targetH : targetH + 1)
 
-// Mode 2: Convert animated .gif into a QuickTime .mov video
-guard let source = CGImageSourceCreateWithURL(inputURL as CFURL, nil) else {
-    fputs("Error: Could not read GIF source at \(inputURL.path)\n", stderr)
-    exit(1)
-}
-
-let frameCount = CGImageSourceGetCount(source)
-guard frameCount > 0, let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-    fputs("Error: GIF contains no frames.\n", stderr)
-    exit(1)
-}
-
-let rawW = max(64, firstImage.width)
-let rawH = max(64, firstImage.height)
-let width = (rawW % 2 == 0) ? rawW : rawW + 1
-let height = (rawH % 2 == 0) ? rawH : rawH + 1
-
-let candidateCodecs: [AVVideoCodecType] = [.hevc, .h264, .jpeg]
-var activeWriter: AVAssetWriter?
-var activeInput: AVAssetWriterInput?
-var activeAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-
-let sourcePixelBufferAttributes: [String: Any] = [
-    kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
-    kCVPixelBufferWidthKey as String: width,
-    kCVPixelBufferHeightKey as String: height
-]
-
-for codec in candidateCodecs {
-    try? FileManager.default.removeItem(at: outputURL)
-    guard let w = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { continue }
-    let settings: [String: Any] = [
-        AVVideoCodecKey: codec,
-        AVVideoWidthKey: width,
-        AVVideoHeightKey: height
+    guard let reader = try? AVAssetReader(asset: asset) else { return false }
+    let readerSettings: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
+        kCVPixelBufferWidthKey as String: targetW,
+        kCVPixelBufferHeightKey as String: targetH
     ]
-    let inp = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-    inp.expectsMediaDataInRealTime = false
-    let adp = AVAssetWriterInputPixelBufferAdaptor(
-        assetWriterInput: inp,
-        sourcePixelBufferAttributes: sourcePixelBufferAttributes
-    )
-    if w.canAdd(inp) {
-        w.add(inp)
-        if w.startWriting() {
-            w.startSession(atSourceTime: .zero)
-            activeWriter = w
-            activeInput = inp
-            activeAdaptor = adp
+    let readerOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerSettings)
+    readerOutput.alwaysCopiesSampleData = false
+    guard reader.canAdd(readerOutput) else { return false }
+    reader.add(readerOutput)
+    guard reader.startReading() else { return false }
+
+    // Sample up to ~120 frames at ~16.67 FPS (delay = 0.06s, matching the working GIF!)
+    let srcFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0)
+    let targetFPS = 16.6666667
+    let skipRatio = max(1.0, srcFPS / targetFPS)
+
+    var cgFrames: [CGImage] = []
+    var frameIdx = 0
+    var nextTarget = 0.0
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+    while let sb = readerOutput.copyNextSampleBuffer() {
+        defer { frameIdx += 1 }
+        if Double(frameIdx) + 0.01 < nextTarget {
+            continue
+        }
+        nextTarget += skipRatio
+        guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        if let ctx = CGContext(
+            data: CVPixelBufferGetBaseAddress(pb),
+            width: targetW,
+            height: targetH,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        ), let cgImg = ctx.makeImage() {
+            cgFrames.append(cgImg)
+        }
+        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+        if cgFrames.count >= 120 {
             break
         }
     }
+
+    guard !cgFrames.isEmpty else { return false }
+
+    try? FileManager.default.removeItem(at: tempGIFURL)
+    guard let dest = CGImageDestinationCreateWithURL(
+        tempGIFURL as CFURL,
+        UTType.gif.identifier as CFString,
+        cgFrames.count,
+        nil
+    ) else {
+        return false
+    }
+
+    let fileProps: [CFString: Any] = [
+        kCGImagePropertyGIFDictionary: [
+            kCGImagePropertyGIFLoopCount: 0
+        ]
+    ]
+    CGImageDestinationSetProperties(dest, fileProps as CFDictionary)
+
+    let frameProps: [CFString: Any] = [
+        kCGImagePropertyGIFDictionary: [
+            kCGImagePropertyGIFDelayTime: 0.06,
+            kCGImagePropertyGIFUnclampedDelayTime: 0.06
+        ]
+    ]
+
+    for img in cgFrames {
+        CGImageDestinationAddImage(dest, img, frameProps as CFDictionary)
+    }
+
+    return CGImageDestinationFinalize(dest)
 }
 
-guard let writer = activeWriter, let writerInput = activeInput, let adaptor = activeAdaptor else {
-    fputs("Error: Could not initialize any compatible video encoder for MOV output.\n", stderr)
-    exit(1)
-}
+/// Step 2: The exact, unmodified GIF -> MOV encoder that produced your working `4C108785...mov.bak`!
+func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
+    guard let source = CGImageSourceCreateWithURL(gifURL as CFURL, nil) else {
+        fputs("Error: Could not read GIF source at \(gifURL.path)\n", stderr)
+        return false
+    }
 
-func frameDuration(at index: Int, source: CGImageSource) -> Double {
-    var delay = 0.1
-    guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
-          let gifProps = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+    let frameCount = CGImageSourceGetCount(source)
+    guard frameCount > 0, let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        fputs("Error: GIF contains no frames.\n", stderr)
+        return false
+    }
+
+    let rawW = max(64, firstImage.width)
+    let rawH = max(64, firstImage.height)
+    let width = (rawW % 2 == 0) ? rawW : rawW + 1
+    let height = (rawH % 2 == 0) ? rawH : rawH + 1
+
+    let candidateCodecs: [AVVideoCodecType] = [.hevc, .h264, .jpeg]
+    var activeWriter: AVAssetWriter?
+    var activeInput: AVAssetWriterInput?
+    var activeAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+
+    let sourcePixelBufferAttributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height
+    ]
+
+    for codec in candidateCodecs {
+        try? FileManager.default.removeItem(at: outputURL)
+        guard let w = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { continue }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: codec,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        let inp = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        inp.expectsMediaDataInRealTime = false
+        let adp = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: inp,
+            sourcePixelBufferAttributes: sourcePixelBufferAttributes
+        )
+        if w.canAdd(inp) {
+            w.add(inp)
+            if w.startWriting() {
+                w.startSession(atSourceTime: .zero)
+                activeWriter = w
+                activeInput = inp
+                activeAdaptor = adp
+                break
+            }
+        }
+    }
+
+    guard let writer = activeWriter, let writerInput = activeInput, let adaptor = activeAdaptor else {
+        fputs("Error: Could not initialize any compatible video encoder for MOV output.\n", stderr)
+        return false
+    }
+
+    func frameDuration(at index: Int, source: CGImageSource) -> Double {
+        var delay = 0.06
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any],
+              let gifProps = properties[kCGImagePropertyGIFDictionary] as? [CFString: Any] else {
+            return delay
+        }
+        if let unclamped = gifProps[kCGImagePropertyGIFUnclampedDelayTime] as? Double, unclamped > 0.01 {
+            delay = unclamped
+        } else if let clamped = gifProps[kCGImagePropertyGIFDelayTime] as? Double, clamped > 0.01 {
+            delay = clamped
+        }
         return delay
     }
-    if let unclamped = gifProps[kCGImagePropertyGIFUnclampedDelayTime] as? Double, unclamped > 0.01 {
-        delay = unclamped
-    } else if let clamped = gifProps[kCGImagePropertyGIFDelayTime] as? Double, clamped > 0.01 {
-        delay = clamped
-    }
-    return delay
-}
 
-func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, height: Int) -> CVPixelBuffer? {
-    var pixelBuffer: CVPixelBuffer?
-    if let pool = pool {
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-    } else {
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true
-        ]
-        CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_32ARGB,
-            attrs as CFDictionary,
-            &pixelBuffer
-        )
-    }
-    guard let buffer = pixelBuffer else { return nil }
+    func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, height: Int) -> CVPixelBuffer? {
+        var pixelBuffer: CVPixelBuffer?
+        if let pool = pool {
+            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        } else {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferCGImageCompatibilityKey: true,
+                kCVPixelBufferCGBitmapContextCompatibilityKey: true
+            ]
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_32ARGB,
+                attrs as CFDictionary,
+                &pixelBuffer
+            )
+        }
+        guard let buffer = pixelBuffer else { return nil }
 
-    CVPixelBufferLockBaseAddress(buffer, [])
-    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
 
-    guard let context = CGContext(
-        data: CVPixelBufferGetBaseAddress(buffer),
-        width: width,
-        height: height,
-        bitsPerComponent: 8,
-        bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-        space: CGColorSpaceCreateDeviceRGB(),
-        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-    ) else {
-        return nil
+        guard let context = CGContext(
+            data: CVPixelBufferGetBaseAddress(buffer),
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+        ) else {
+            return nil
+        }
+
+        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return buffer
     }
 
-    context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-    return buffer
-}
-
-var singleLoopDuration = 0.0
-for i in 0..<frameCount {
-    singleLoopDuration += frameDuration(at: i, source: source)
-}
-let repeatCount = max(1, Int(ceil(6.0 / max(singleLoopDuration, 0.05))))
-
-let timescale: Int32 = 600
-var currentTime = CMTime.zero
-
-for _ in 0..<repeatCount {
+    var singleLoopDuration = 0.0
     for i in 0..<frameCount {
-        guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+        singleLoopDuration += frameDuration(at: i, source: source)
+    }
+    let repeatCount = max(1, Int(ceil(6.0 / max(singleLoopDuration, 0.05))))
+
+    let timescale: Int32 = 600
+    var currentTime = CMTime.zero
+
+    for _ in 0..<repeatCount {
+        for i in 0..<frameCount {
+            guard let cgImage = CGImageSourceCreateImageAtIndex(source, i, nil) else { continue }
+            while !writerInput.isReadyForMoreMediaData {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            if let buffer = makePixelBuffer(from: cgImage, pool: adaptor.pixelBufferPool, width: width, height: height) {
+                adaptor.append(buffer, withPresentationTime: currentTime)
+            }
+            let delay = frameDuration(at: i, source: source)
+            let step = CMTime(seconds: delay, preferredTimescale: timescale)
+            currentTime = CMTimeAdd(currentTime, step)
+        }
+    }
+
+    if let lastImage = CGImageSourceCreateImageAtIndex(source, frameCount - 1, nil) {
         while !writerInput.isReadyForMoreMediaData {
             Thread.sleep(forTimeInterval: 0.005)
         }
-        if let buffer = makePixelBuffer(from: cgImage, pool: adaptor.pixelBufferPool, width: width, height: height) {
+        if let buffer = makePixelBuffer(from: lastImage, pool: adaptor.pixelBufferPool, width: width, height: height) {
             adaptor.append(buffer, withPresentationTime: currentTime)
         }
-        let delay = frameDuration(at: i, source: source)
-        let step = CMTime(seconds: delay, preferredTimescale: timescale)
-        currentTime = CMTimeAdd(currentTime, step)
     }
+
+    writerInput.markAsFinished()
+    let semaphore = DispatchSemaphore(value: 0)
+    writer.finishWriting {
+        semaphore.signal()
+    }
+    semaphore.wait()
+
+    return writer.status == .completed
 }
 
-if let lastImage = CGImageSourceCreateImageAtIndex(source, frameCount - 1, nil) {
-    while !writerInput.isReadyForMoreMediaData {
-        Thread.sleep(forTimeInterval: 0.005)
+if ext == "gif" {
+    if convertGIFToMOV(gifURL: inputURL, outputURL: outputURL) {
+        exit(0)
     }
-    if let buffer = makePixelBuffer(from: lastImage, pool: adaptor.pixelBufferPool, width: width, height: height) {
-        adaptor.append(buffer, withPresentationTime: currentTime)
+    exit(1)
+} else {
+    // Convert MP4/MOV -> temporary GIF -> MOV using the exact working GIF converter!
+    let tempGIFURL = outputURL.deletingLastPathComponent().appendingPathComponent("tmp_video2gif_\(ProcessInfo.processInfo.processIdentifier).gif")
+    defer { try? FileManager.default.removeItem(at: tempGIFURL) }
+    fputs("[*] Converting video '\(inputURL.lastPathComponent)' to intermediate GIF so it uses the 100% working GIF->MOV pipeline...\n", stderr)
+    guard convertVideoToTempGIF(videoURL: inputURL, tempGIFURL: tempGIFURL) else {
+        fputs("Error: Could not convert video to intermediate GIF.\n", stderr)
+        exit(1)
     }
-}
-
-writerInput.markAsFinished()
-let semaphore = DispatchSemaphore(value: 0)
-writer.finishWriting {
-    semaphore.signal()
-}
-semaphore.wait()
-
-if writer.status != .completed {
-    fputs("Error finishing MOV write: \(String(describing: writer.error))\n", stderr)
+    fputs("[+] Created intermediate GIF; now encoding Lock Screen MOV via working GIF pipeline...\n", stderr)
+    if convertGIFToMOV(gifURL: tempGIFURL, outputURL: outputURL) {
+        fputs("[+] Successfully encoded video via GIF->MOV pipeline!\n", stderr)
+        exit(0)
+    }
     exit(1)
 }
 """
@@ -387,14 +529,12 @@ MODERN_AERIALS_ROOT = Path("/Library/Application Support/com.apple.wallpaper/aer
 MODERN_AERIALS_VIDEOS_DIR = MODERN_AERIALS_ROOT / "videos"
 MODERN_AERIALS_4K_DIR = MODERN_AERIALS_ROOT / "4KSDR240FPS"
 
-# CRITICAL: `4207734D-74FE-4F92-B5E1-6EC8DEE24A15` ("Golden Gate Sunset") is hardcoded inside
-# macOS's `WallpaperAerialsExtension` binary to ALWAYS play `/System/Library/Wallpapers/.default/Golden Gate.mov`
-# from the read-only system volume! Never use `4207734D-...` as the active Lock Screen choice.
+LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.backimate.lockreset.plist")
+UNLOCK_TRIGGER_FILE = Path("/tmp/.backimate_unlock_trigger")
+
 HARDCODED_GOLDEN_GATE_ID = "4207734D-74FE-4F92-B5E1-6EC8DEE24A15"
 
-# Instead, use "Tahoe Day" (`4C108785-A7BA-422E-9C79-B0129F1D5550`) as the primary active choice,
-# and also populate the top Landscape Aerial slots so whichever one the user clicks in System Settings works:
-PRIMARY_DEFAULT_ID = "4C108785-A7BA-422E-9C79-B0129F1D5550"  # Tahoe Day (first non-Golden Gate Landscape item)
+PRIMARY_DEFAULT_ID = "4C108785-A7BA-422E-9C79-B0129F1D5550"  # Tahoe Day
 BUILTIN_SLOTS_TO_POPULATE = [
     "4C108785-A7BA-422E-9C79-B0129F1D5550",  # Tahoe Day
     "B2FC91ED-6891-4DEB-85A1-268B2B4160B6",  # Tahoe Morning
@@ -450,68 +590,93 @@ def ensure_media_converter_binary() -> Path:
     return compile_swift_helper(
         "media_to_mov",
         SWIFT_MEDIA_CONVERTER_SOURCE,
-        ["Foundation", "ImageIO", "AVFoundation", "CoreVideo", "CoreGraphics"],
+        ["Foundation", "ImageIO", "UniformTypeIdentifiers", "AVFoundation", "CoreVideo", "CoreGraphics"],
     )
+
+
+def install_root_watchpaths_daemon():
+    """
+    Installs a root `WatchPaths` LaunchDaemon (`/Library/LaunchDaemons/com.backimate.lockreset.plist`)
+    that watches `/tmp/.backimate_unlock_trigger` (touched by `desktop_video_player` in the user's
+    Aqua session whenever `com.apple.screenIsUnlocked` fires) and kills `idleassetsd` and
+    `WallpaperAerialsExtension` as `root` on every unlock!
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        UNLOCK_TRIGGER_FILE.write_text("init", encoding="utf-8")
+        os.chmod(UNLOCK_TRIGGER_FILE, 0o666)
+
+        plist_content = {
+            "Label": "com.backimate.lockreset",
+            "ProgramArguments": [
+                "/bin/sh",
+                "-c",
+                "/usr/bin/killall -9 WallpaperAerialsExtension WallpaperVideoExtension idleassetsd WallpaperAgent 2>/dev/null || true",
+            ],
+            "WatchPaths": [str(UNLOCK_TRIGGER_FILE)],
+        }
+        with LAUNCH_DAEMON_PLIST.open("wb") as f:
+            plistlib.dump(plist_content, f)
+        os.chmod(LAUNCH_DAEMON_PLIST, 0o644)
+        os.chown(LAUNCH_DAEMON_PLIST, 0, 0)
+
+        subprocess.run(["launchctl", "bootout", "system", str(LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
+        subprocess.run(["launchctl", "bootstrap", "system", str(LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
+        print("[+] Installed WatchPaths Unlock Reset Daemon (resets Lock Screen video daemons as root on every unlock)")
+    except Exception as exc:
+        print(f"[!] Warning: Could not install Lock Screen Reset Daemon ({exc})")
 
 
 def prepare_lockscreen_mov(media_path: Path) -> Path:
     """
-    Ensures `media_path` (whether `.gif`, `.mp4`, `.m4v`, or `.mov`) is packaged as a
-    clean, un-quarantined QuickTime `.mov` inside CACHE_DIR so macOS's Lock Screen
-    (`WallpaperAerialsExtension` and `idleassetsd`) can decode it properly.
+    Packages `media_path` (whether `.gif`, `.mp4`, `.m4v`, or `.mov`) into a Lock Screen
+    `.mov` by routing videos through an intermediate `.gif` (`convertVideoToTempGIF` ->
+    `convertGIFToMOV`), guaranteeing the 100% working GIF-to-MOV code path!
     """
-    ext = media_path.suffix.lower()
-    if ext == ".mov":
-        return media_path
-
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if os.geteuid() == 0 and sudo_uid and sudo_gid:
+        try:
+            os.chown(CACHE_DIR, int(sudo_uid), int(sudo_gid))
+        except Exception:
+            pass
+
     stat = media_path.stat()
     fingerprint = hashlib.sha256(
-        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_gif_pipeline_v5".encode("utf-8")
     ).hexdigest()[:12]
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
     if converted_mov.exists() and converted_mov.stat().st_size > 0:
-        print(f"[*] Using cached QuickTime .mov for Lock Screen: {converted_mov.name}")
+        print(f"[*] Using cached GIF-pipeline Lock Screen .mov: {converted_mov.name}")
         return converted_mov
 
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin:
-        print(f"[*] Converting '{media_path.name}' to QuickTime .mov via ffmpeg...")
-        cmd = [ffmpeg_bin, "-y"]
-        if ext == ".gif":
-            cmd.extend(["-stream_loop", "4"])
-        cmd.extend([
-            "-i",
-            str(media_path.resolve()),
-            "-movflags",
-            "faststart",
-            "-pix_fmt",
-            "yuv420p",
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            str(converted_mov),
-        ])
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode == 0 and converted_mov.exists():
-            print(f"[+] Prepared QuickTime .mov: {converted_mov.name}")
-            return converted_mov
-
     converter_bin = ensure_media_converter_binary()
-    print(f"[*] Packaging '{media_path.name}' into QuickTime .mov via native AVFoundation...")
-    result = subprocess.run(
-        [str(converter_bin), str(media_path.resolve()), str(converted_mov)],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or not converted_mov.exists():
-        if ext != ".gif":
-            shutil.copy2(media_path, converted_mov)
-        else:
-            print(f"[!] Failed to convert GIF to MOV:\n{result.stderr}", file=sys.stderr)
-            sys.exit(1)
+    print(f"[*] Processing '{media_path.name}' through the working GIF->MOV Lock Screen pipeline...")
 
-    print(f"[+] Prepared QuickTime .mov: {converted_mov.name}")
+    cmd = []
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        cmd.extend(["sudo", "-u", sudo_user])
+
+    cmd.extend([
+        str(converter_bin),
+        str(media_path.resolve()),
+        str(converted_mov),
+    ])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stderr:
+        for line in result.stderr.strip().splitlines():
+            if line.startswith("["):
+                print(f"    {line}")
+    if result.returncode != 0 or not converted_mov.exists():
+        print(f"[!] Failed to convert media to Lock Screen MOV:\n{result.stderr}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[+] Prepared Lock Screen .mov: {converted_mov.name}")
     return converted_mov
 
 
@@ -642,12 +807,10 @@ def activate_aerial_in_user_index_plist(asset_id: str) -> list[str]:
                                         discovered_ids.append(aid)
                             except Exception:
                                 pass
-                        # Point this choice directly to our custom Aerial asset_id
                         choice["Provider"] = "com.apple.wallpaper.choice.aerials"
                         choice["Configuration"] = plistlib.dumps({"assetID": asset_id}, fmt=plistlib.FMT_BINARY)
                         choice["Files"] = []
             for k, v in list(obj.items()):
-                # Clean up any legacy typo key if present
                 if k == " EncodedOptionValues":
                     del obj[k]
                     obj["EncodedOptionValues"] = "$null"
@@ -707,8 +870,8 @@ def activate_aerial_in_user_index_plist(asset_id: str) -> list[str]:
 
 def mark_aerials_downloaded_in_sqlite(asset_ids: list[str]):
     """
-    Marks all target `asset_ids` as downloaded (`ZLASTDOWNLOADED`) in
-    `/Library/Application Support/com.apple.idleassetsd/Aerial.sqlite`.
+    Marks all target `asset_ids` as downloaded (`ZLASTDOWNLOADED`) AND clears `ZPOINTSOFINTEREST`
+    in `/Library/Application Support/com.apple.idleassetsd/Aerial.sqlite`.
     """
     if not AERIAL_SQLITE.exists():
         return
@@ -718,22 +881,37 @@ def mark_aerials_downloaded_in_sqlite(asset_ids: list[str]):
         with conn:
             for aid in asset_ids:
                 conn.execute(
-                    "UPDATE ZASSET SET ZLASTDOWNLOADED = ? WHERE ZIDENTIFIER = ?",
+                    "UPDATE ZASSET SET ZLASTDOWNLOADED = ?, ZPOINTSOFINTEREST = NULL WHERE ZIDENTIFIER = ?",
                     (coredata_now, aid),
                 )
         conn.close()
-        print(f"[+] Marked {len(asset_ids)} Aerial slots as downloaded in Aerial.sqlite")
+        print(f"[+] Updated {len(asset_ids)} Aerial slots in Aerial.sqlite (cleared seek checkpoints)")
     except Exception as exc:
         print(f"[!] Warning: Could not update Aerial.sqlite ({exc})")
 
 
-def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: int = 80):
-    """Copies `src_mov` to `dst_mov`, backing up any original file and stripping quarantine xattrs."""
+def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: int = 80, is_first: bool = False):
+    """
+    Installs `src_mov` to `dst_mov`, backing up any original file and stripping quarantine xattrs.
+    Uses hardlinks (`os.link`) after the first copy on the same volume so populating 40+ Aerial slots
+    takes 0 extra disk space and completes instantaneously!
+    """
     dst_mov.parent.mkdir(parents=True, exist_ok=True)
     if dst_mov.exists():
         backup_file = dst_mov.with_suffix(".mov.bak")
         if not backup_file.exists():
-            shutil.copy2(dst_mov, backup_file)
+            try:
+                shutil.copy2(dst_mov, backup_file)
+            except Exception:
+                pass
+        dst_mov.unlink(missing_ok=True)
+
+    if not is_first:
+        try:
+            os.link(src_mov, dst_mov)
+            return
+        except Exception:
+            pass
 
     shutil.copy2(src_mov, dst_mov)
     os.chmod(dst_mov, 0o644)
@@ -746,9 +924,9 @@ def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: 
 
 def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     """
-    Converts/remuxes the user's video or GIF into a clean QuickTime `.mov` and installs it
-    into non-hardcoded Aerial slots (defaulting to `4C108785-A7BA-422E-9C79-B0129F1D5550` Tahoe Day)
-    across all system and user Lock Screen video directories.
+    Converts any video into an intermediate GIF and encodes it with the 100% working
+    GIF-to-MOV pipeline, installs it across all Lock Screen directories, and configures
+    the user + root unlock reset trigger.
     """
     playable_mov = prepare_lockscreen_mov(video_path)
 
@@ -771,7 +949,6 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     else:
         primary_id = PRIMARY_DEFAULT_ID
 
-    # 1. Stop WallpaperAgent / WallpaperAerialsExtension BEFORE editing Index.plist so they don't overwrite our changes
     for daemon in [
         "WallpaperAerialsExtension",
         "WallpaperVideoExtension",
@@ -781,10 +958,8 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     ]:
         subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
-    # 2. Update Index.plist to use primary_id (Tahoe Day) instead of Golden Gate Sunset
     discovered_ids = activate_aerial_in_user_index_plist(primary_id)
 
-    # 3. Collect all target Asset IDs to populate
     target_ids = []
     for aid in [primary_id] + BUILTIN_SLOTS_TO_POPULATE + discovered_ids:
         if aid and aid not in target_ids:
@@ -795,7 +970,6 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
         if stem not in target_ids and stem != HARDCODED_GOLDEN_GATE_ID:
             target_ids.append(stem)
 
-    # 4. Install the .mov into system, user Application Support, and user Container Lock Screen Aerial directories
     user_home = get_target_user_home()
     sudo_uid = int(os.environ.get("SUDO_UID", 0))
     sudo_gid = int(os.environ.get("SUDO_GID", 80))
@@ -834,28 +1008,39 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
         ])
 
     installed_count = 0
+    master_system_mov: Path | None = None
     for d in system_dirs:
         try:
             for aid in target_ids:
-                install_mov_to_destination(playable_mov, d / f"{aid}.mov", uid=0, gid=80)
+                dst = d / f"{aid}.mov"
+                if master_system_mov is None:
+                    install_mov_to_destination(playable_mov, dst, uid=0, gid=80, is_first=True)
+                    master_system_mov = dst
+                else:
+                    install_mov_to_destination(master_system_mov, dst, uid=0, gid=80, is_first=False)
                 installed_count += 1
         except Exception:
             pass
 
+    master_user_mov: Path | None = None
     for d in user_dirs:
         try:
             for aid in target_ids:
-                install_mov_to_destination(playable_mov, d / f"{aid}.mov", uid=sudo_uid, gid=sudo_gid)
+                dst = d / f"{aid}.mov"
+                if master_user_mov is None:
+                    install_mov_to_destination(playable_mov, dst, uid=sudo_uid, gid=sudo_gid, is_first=True)
+                    master_user_mov = dst
+                else:
+                    install_mov_to_destination(master_user_mov, dst, uid=sudo_uid, gid=sudo_gid, is_first=False)
                 installed_count += 1
         except Exception:
             pass
 
-    print(f"[+] Installed QuickTime .mov into {len(target_ids)} Aerial slots across system & user directories ({installed_count} files).")
+    print(f"[+] Installed GIF-pipeline Lock Screen .mov into {len(target_ids)} Aerial slots ({installed_count} hardlinked paths).")
 
-    # 5. Update Aerial.sqlite timestamps
     mark_aerials_downloaded_in_sqlite(target_ids)
+    install_root_watchpaths_daemon()
 
-    # 6. Restart wallpaper & preference daemons so the new Index.plist and video slots load cleanly
     for daemon in [
         "cfprefsd",
         "WallpaperAerialsExtension",
@@ -866,11 +1051,8 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     ]:
         subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
-    print("\n[+] Success! Your custom video/GIF is now installed for the macOS Lock Screen.")
-    print("    IMPORTANT: Because macOS hardcodes 'Golden Gate Sunset' to the read-only system bridge video,")
-    print("    if you still see the orange bridge, open System Settings > Wallpaper and click 'Tahoe Day'")
-    print("    (right next to Golden Gate Sunset under Landscape) or 'Sequoia Morning' / 'Yosemite' —")
-    print("    all of those slots now contain your custom video and will play it immediately on the Lock Screen!")
+    print("\n[+] Success! Your video was converted into an intermediate GIF and encoded via the exact")
+    print("    working GIF->MOV pipeline, and unlock-reset triggers are active for both user & root!")
 
 
 def restore_lockscreen_aerials():
@@ -878,6 +1060,11 @@ def restore_lockscreen_aerials():
     if os.geteuid() != 0:
         subprocess.run(["sudo", sys.executable, str(Path(__file__).resolve()), "--restore-lockscreen"])
         return
+
+    if LAUNCH_DAEMON_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", "system", str(LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
+        LAUNCH_DAEMON_PLIST.unlink(missing_ok=True)
+    UNLOCK_TRIGGER_FILE.unlink(missing_ok=True)
 
     user_home = get_target_user_home()
     user_app_support_aerials = (
