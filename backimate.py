@@ -236,132 +236,51 @@ let ext = inputURL.pathExtension.lowercased()
 
 try? FileManager.default.removeItem(at: outputURL)
 
-/// Step 1: If the input is a video (.mp4, .mov, .m4v), we first convert its frames into an
-/// in-memory or temporary `.gif` via `CGImageDestination` so that Step 2 (`convertGIFToMOV`)
-/// runs the EXACT SAME 100% working `CGImageSource` -> `AVAssetWriter` code path that works for GIFs!
-func convertVideoToTempGIF(videoURL: URL, tempGIFURL: URL) -> Bool {
-    let asset = AVURLAsset(url: videoURL)
-    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
-        return false
+/// Shared pixel-buffer builder used by both `convertGIFToMOV` and `convertVideoTo4KMOV`:
+/// draws a `CGImage` into a clean `32ARGB` `DeviceRGB` buffer from `adaptor.pixelBufferPool`
+/// with zero source `CVBuffer` attachments so `WallpaperAerialsExtension` decodes cleanly.
+func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, height: Int) -> CVPixelBuffer? {
+    var pixelBuffer: CVPixelBuffer?
+    if let pool = pool {
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+    } else {
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+        CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32ARGB,
+            attrs as CFDictionary,
+            &pixelBuffer
+        )
     }
+    guard let buffer = pixelBuffer else { return nil }
 
-    let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
-    let srcW = abs(naturalSize.width)
-    let srcH = abs(naturalSize.height)
-    let maxDim: CGFloat = 1280.0
-    var targetW = Int(srcW)
-    var targetH = Int(srcH)
-    if srcW > maxDim || srcH > maxDim {
-        let scale = min(maxDim / max(srcW, 1.0), maxDim / max(srcH, 1.0))
-        targetW = Int(srcW * scale)
-        targetH = Int(srcH * scale)
-    }
-    targetW = max(64, (targetW % 2 == 0) ? targetW : targetW + 1)
-    targetH = max(64, (targetH % 2 == 0) ? targetH : targetH + 1)
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
 
-    guard let reader = try? AVAssetReader(asset: asset) else { return false }
-    let readerSettings: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
-        kCVPixelBufferWidthKey as String: targetW,
-        kCVPixelBufferHeightKey as String: targetH
-    ]
-    let readerOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerSettings)
-    readerOutput.alwaysCopiesSampleData = false
-    guard reader.canAdd(readerOutput) else { return false }
-    reader.add(readerOutput)
-    guard reader.startReading() else { return false }
-
-    // Sample up to ~120 frames at ~16.67 FPS (delay = 0.06s, matching the working GIF!)
-    let srcFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0)
-    let targetFPS = 16.6666667
-    let skipRatio = max(1.0, srcFPS / targetFPS)
-
-    var cgFrames: [CGImage] = []
-    var frameIdx = 0
-    var nextTarget = 0.0
-    let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-    while let sb = readerOutput.copyNextSampleBuffer() {
-        defer { frameIdx += 1 }
-        if Double(frameIdx) + 0.01 < nextTarget {
-            continue
-        }
-        nextTarget += skipRatio
-        guard let pb = CMSampleBufferGetImageBuffer(sb) else { continue }
-        CVPixelBufferLockBaseAddress(pb, .readOnly)
-        if let ctx = CGContext(
-            data: CVPixelBufferGetBaseAddress(pb),
-            width: targetW,
-            height: targetH,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-        ), let cgImg = ctx.makeImage() {
-            cgFrames.append(cgImg)
-        }
-        CVPixelBufferUnlockBaseAddress(pb, .readOnly)
-        if cgFrames.count >= 120 {
-            break
-        }
-    }
-
-    guard !cgFrames.isEmpty else { return false }
-
-    try? FileManager.default.removeItem(at: tempGIFURL)
-    guard let dest = CGImageDestinationCreateWithURL(
-        tempGIFURL as CFURL,
-        UTType.gif.identifier as CFString,
-        cgFrames.count,
-        nil
+    guard let context = CGContext(
+        data: CVPixelBufferGetBaseAddress(buffer),
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
     ) else {
-        return false
+        return nil
     }
 
-    let fileProps: [CFString: Any] = [
-        kCGImagePropertyGIFDictionary: [
-            kCGImagePropertyGIFLoopCount: 0
-        ]
-    ]
-    CGImageDestinationSetProperties(dest, fileProps as CFDictionary)
-
-    let frameProps: [CFString: Any] = [
-        kCGImagePropertyGIFDictionary: [
-            kCGImagePropertyGIFDelayTime: 0.06,
-            kCGImagePropertyGIFUnclampedDelayTime: 0.06
-        ]
-    ]
-
-    for img in cgFrames {
-        CGImageDestinationAddImage(dest, img, frameProps as CFDictionary)
-    }
-
-    return CGImageDestinationFinalize(dest)
+    context.clear(CGRect(x: 0, y: 0, width: width, height: height))
+    context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    return buffer
 }
 
-/// Step 2: The exact, unmodified GIF -> MOV encoder that produced your working `4C108785...mov.bak`!
-func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
-    guard let source = CGImageSourceCreateWithURL(gifURL as CFURL, nil) else {
-        fputs("Error: Could not read GIF source at \(gifURL.path)\n", stderr)
-        return false
-    }
-
-    let frameCount = CGImageSourceGetCount(source)
-    guard frameCount > 0, let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-        fputs("Error: GIF contains no frames.\n", stderr)
-        return false
-    }
-
-    let rawW = max(64, firstImage.width)
-    let rawH = max(64, firstImage.height)
-    let width = (rawW % 2 == 0) ? rawW : rawW + 1
-    let height = (rawH % 2 == 0) ? rawH : rawH + 1
-
+func makeMOVWriter(outputURL: URL, width: Int, height: Int) -> (AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor)? {
     let candidateCodecs: [AVVideoCodecType] = [.hevc, .h264, .jpeg]
-    var activeWriter: AVAssetWriter?
-    var activeInput: AVAssetWriterInput?
-    var activeAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-
     let sourcePixelBufferAttributes: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
         kCVPixelBufferWidthKey as String: width,
@@ -386,15 +305,163 @@ func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
             w.add(inp)
             if w.startWriting() {
                 w.startSession(atSourceTime: .zero)
-                activeWriter = w
-                activeInput = inp
-                activeAdaptor = adp
+                return (w, inp, adp)
+            }
+        }
+    }
+    return nil
+}
+
+/// Encodes `.mp4` / `.mov` / `.m4v` at native 4K resolution (up to 3840x2160) using the
+/// exact same `CGImage` -> `makePixelBuffer` -> `AVAssetWriter` pipeline as `convertGIFToMOV`.
+func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
+    let asset = AVURLAsset(url: videoURL)
+    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        fputs("Error: No video track found in \(videoURL.path)\n", stderr)
+        return false
+    }
+
+    let naturalSize = videoTrack.naturalSize.applying(videoTrack.preferredTransform)
+    let srcW = abs(naturalSize.width)
+    let srcH = abs(naturalSize.height)
+    let maxDim: CGFloat = 3840.0
+    var targetW = Int(srcW)
+    var targetH = Int(srcH)
+    if srcW > maxDim || srcH > maxDim {
+        let scale = min(maxDim / max(srcW, 1.0), maxDim / max(srcH, 1.0))
+        targetW = Int(srcW * scale)
+        targetH = Int(srcH * scale)
+    }
+    targetW = max(64, (targetW % 2 == 0) ? targetW : targetW + 1)
+    targetH = max(64, (targetH % 2 == 0) ? targetH : targetH + 1)
+
+    guard let (writer, writerInput, adaptor) = makeMOVWriter(outputURL: outputURL, width: targetW, height: targetH) else {
+        fputs("Error: Could not initialize 4K MOV encoder.\n", stderr)
+        return false
+    }
+
+    // Use the exact same timing cadence (0.06s / 16.67 FPS, timescale 600, ~120 frames) as the working GIF pipeline
+    let srcFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0)
+    let delay = 0.06
+    let targetFPS = 1.0 / delay
+    let skipRatio = max(1.0, srcFPS / targetFPS)
+    let timescale: Int32 = 600
+    let step = CMTime(seconds: delay, preferredTimescale: timescale)
+
+    let durationSec = max(0.1, CMTimeGetSeconds(asset.duration))
+    let repeatCount = max(1, Int(ceil(6.0 / min(durationSec, 7.2))))
+    let maxTotalFrames = 120
+
+    var currentTime = CMTime.zero
+    var totalWritten = 0
+    var lastCGImage: CGImage?
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+    for _ in 0..<repeatCount {
+        if totalWritten >= maxTotalFrames { break }
+        guard let reader = try? AVAssetReader(asset: asset) else { break }
+        let readerSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32ARGB),
+            kCVPixelBufferWidthKey as String: targetW,
+            kCVPixelBufferHeightKey as String: targetH
+        ]
+        let readerOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerSettings)
+        readerOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(readerOutput) else { break }
+        reader.add(readerOutput)
+        guard reader.startReading() else { break }
+
+        var frameIdx = 0
+        var nextTarget = 0.0
+
+        while let sb = readerOutput.copyNextSampleBuffer() {
+            defer { frameIdx += 1 }
+            if Double(frameIdx) + 0.01 < nextTarget {
+                continue
+            }
+            nextTarget += skipRatio
+
+            autoreleasepool {
+                guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
+                CVPixelBufferLockBaseAddress(pb, .readOnly)
+                let cgImg: CGImage? = {
+                    guard let ctx = CGContext(
+                        data: CVPixelBufferGetBaseAddress(pb),
+                        width: targetW,
+                        height: targetH,
+                        bitsPerComponent: 8,
+                        bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                        space: colorSpace,
+                        bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
+                    ) else { return nil }
+                    return ctx.makeImage()
+                }()
+                CVPixelBufferUnlockBaseAddress(pb, .readOnly)
+
+                guard let validImg = cgImg else { return }
+                lastCGImage = validImg
+
+                while !writerInput.isReadyForMoreMediaData {
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                if let buffer = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
+                    adaptor.append(buffer, withPresentationTime: currentTime)
+                    currentTime = CMTimeAdd(currentTime, step)
+                    totalWritten += 1
+                }
+            }
+
+            if totalWritten >= maxTotalFrames {
+                reader.cancelReading()
                 break
             }
         }
     }
 
-    guard let writer = activeWriter, let writerInput = activeInput, let adaptor = activeAdaptor else {
+    guard totalWritten > 0 else {
+        writer.cancelWriting()
+        return false
+    }
+
+    if let finalImg = lastCGImage {
+        while !writerInput.isReadyForMoreMediaData {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        if let buffer = makePixelBuffer(from: finalImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
+            adaptor.append(buffer, withPresentationTime: currentTime)
+        }
+    }
+
+    writerInput.markAsFinished()
+    let semaphore = DispatchSemaphore(value: 0)
+    writer.finishWriting {
+        semaphore.signal()
+    }
+    semaphore.wait()
+
+    fputs("[+] Encoded \(totalWritten) frames at \(targetW)x\(targetH) (4K Lock Screen pipeline)\n", stderr)
+    return writer.status == .completed
+}
+
+/// Encodes `.gif` files to `.mov` using the exact same `makePixelBuffer` -> `AVAssetWriter` pipeline.
+func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
+    guard let source = CGImageSourceCreateWithURL(gifURL as CFURL, nil) else {
+        fputs("Error: Could not read GIF source at \(gifURL.path)\n", stderr)
+        return false
+    }
+
+    let frameCount = CGImageSourceGetCount(source)
+    guard frameCount > 0, let firstImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        fputs("Error: GIF contains no frames.\n", stderr)
+        return false
+    }
+
+    let rawW = max(64, firstImage.width)
+    let rawH = max(64, firstImage.height)
+    let width = (rawW % 2 == 0) ? rawW : rawW + 1
+    let height = (rawH % 2 == 0) ? rawH : rawH + 1
+
+    guard let (writer, writerInput, adaptor) = makeMOVWriter(outputURL: outputURL, width: width, height: height) else {
         fputs("Error: Could not initialize any compatible video encoder for MOV output.\n", stderr)
         return false
     }
@@ -411,46 +478,6 @@ func convertGIFToMOV(gifURL: URL, outputURL: URL) -> Bool {
             delay = clamped
         }
         return delay
-    }
-
-    func makePixelBuffer(from image: CGImage, pool: CVPixelBufferPool?, width: Int, height: Int) -> CVPixelBuffer? {
-        var pixelBuffer: CVPixelBuffer?
-        if let pool = pool {
-            CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-        } else {
-            let attrs: [CFString: Any] = [
-                kCVPixelBufferCGImageCompatibilityKey: true,
-                kCVPixelBufferCGBitmapContextCompatibilityKey: true
-            ]
-            CVPixelBufferCreate(
-                kCFAllocatorDefault,
-                width,
-                height,
-                kCVPixelFormatType_32ARGB,
-                attrs as CFDictionary,
-                &pixelBuffer
-            )
-        }
-        guard let buffer = pixelBuffer else { return nil }
-
-        CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-
-        guard let context = CGContext(
-            data: CVPixelBufferGetBaseAddress(buffer),
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue
-        ) else {
-            return nil
-        }
-
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        return buffer
     }
 
     var singleLoopDuration = 0.0
@@ -502,17 +529,8 @@ if ext == "gif" {
     }
     exit(1)
 } else {
-    // Convert MP4/MOV -> temporary GIF -> MOV using the exact working GIF converter!
-    let tempGIFURL = outputURL.deletingLastPathComponent().appendingPathComponent("tmp_video2gif_\(ProcessInfo.processInfo.processIdentifier).gif")
-    defer { try? FileManager.default.removeItem(at: tempGIFURL) }
-    fputs("[*] Converting video '\(inputURL.lastPathComponent)' to intermediate GIF so it uses the 100% working GIF->MOV pipeline...\n", stderr)
-    guard convertVideoToTempGIF(videoURL: inputURL, tempGIFURL: tempGIFURL) else {
-        fputs("Error: Could not convert video to intermediate GIF.\n", stderr)
-        exit(1)
-    }
-    fputs("[+] Created intermediate GIF; now encoding Lock Screen MOV via working GIF pipeline...\n", stderr)
-    if convertGIFToMOV(gifURL: tempGIFURL, outputURL: outputURL) {
-        fputs("[+] Successfully encoded video via GIF->MOV pipeline!\n", stderr)
+    fputs("[*] Encoding '\(inputURL.lastPathComponent)' at native 4K resolution (up to 3840x2160) for Lock Screen...\n", stderr)
+    if convertVideoTo4KMOV(videoURL: inputURL, outputURL: outputURL) {
         exit(0)
     }
     exit(1)
@@ -631,8 +649,7 @@ def install_root_watchpaths_daemon():
 def prepare_lockscreen_mov(media_path: Path) -> Path:
     """
     Packages `media_path` (whether `.gif`, `.mp4`, `.m4v`, or `.mov`) into a Lock Screen
-    `.mov` by routing videos through an intermediate `.gif` (`convertVideoToTempGIF` ->
-    `convertGIFToMOV`), guaranteeing the 100% working GIF-to-MOV code path!
+    `.mov` at native 4K resolution (up to 3840x2160) using the clean 32ARGB DeviceRGB pipeline.
     """
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     sudo_uid = os.environ.get("SUDO_UID")
@@ -645,16 +662,16 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
 
     stat = media_path.stat()
     fingerprint = hashlib.sha256(
-        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_gif_pipeline_v5".encode("utf-8")
+        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_pipeline_v6".encode("utf-8")
     ).hexdigest()[:12]
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
     if converted_mov.exists() and converted_mov.stat().st_size > 0:
-        print(f"[*] Using cached GIF-pipeline Lock Screen .mov: {converted_mov.name}")
+        print(f"[*] Using cached 4K Lock Screen .mov: {converted_mov.name}")
         return converted_mov
 
     converter_bin = ensure_media_converter_binary()
-    print(f"[*] Processing '{media_path.name}' through the working GIF->MOV Lock Screen pipeline...")
+    print(f"[*] Encoding '{media_path.name}' at native 4K (up to 3840x2160) for Lock Screen...")
 
     cmd = []
     sudo_user = os.environ.get("SUDO_USER")
@@ -676,7 +693,7 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
         print(f"[!] Failed to convert media to Lock Screen MOV:\n{result.stderr}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[+] Prepared Lock Screen .mov: {converted_mov.name}")
+    print(f"[+] Prepared 4K Lock Screen .mov: {converted_mov.name}")
     return converted_mov
 
 
@@ -924,9 +941,8 @@ def install_mov_to_destination(src_mov: Path, dst_mov: Path, uid: int = 0, gid: 
 
 def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     """
-    Converts any video into an intermediate GIF and encodes it with the 100% working
-    GIF-to-MOV pipeline, installs it across all Lock Screen directories, and configures
-    the user + root unlock reset trigger.
+    Encodes any video or GIF into a native 4K Lock Screen `.mov`, installs it across all
+    Lock Screen directories, and configures the user + root unlock reset trigger.
     """
     playable_mov = prepare_lockscreen_mov(video_path)
 
@@ -1036,7 +1052,7 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
         except Exception:
             pass
 
-    print(f"[+] Installed GIF-pipeline Lock Screen .mov into {len(target_ids)} Aerial slots ({installed_count} hardlinked paths).")
+    print(f"[+] Installed 4K Lock Screen .mov into {len(target_ids)} Aerial slots ({installed_count} hardlinked paths).")
 
     mark_aerials_downloaded_in_sqlite(target_ids)
     install_root_watchpaths_daemon()
@@ -1051,8 +1067,7 @@ def apply_lockscreen_aerial(video_path: Path, target_id: str | None = None):
     ]:
         subprocess.run(["killall", "-9", daemon], stderr=subprocess.DEVNULL)
 
-    print("\n[+] Success! Your video was converted into an intermediate GIF and encoded via the exact")
-    print("    working GIF->MOV pipeline, and unlock-reset triggers are active for both user & root!")
+    print("\n[+] Success! Your video is now running at native 4K resolution on both Desktop and Lock Screen!")
 
 
 def restore_lockscreen_aerials():
