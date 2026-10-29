@@ -87,8 +87,8 @@ class WallpaperAppDelegate: NSObject, NSApplicationDelegate {
             task.standardError = FileHandle.nullDevice
             try? task.run()
         }
-        // 2. Touch /tmp/.backimate_unlock_trigger so the root WatchPaths LaunchDaemon also resets idleassetsd as root!
-        let triggerPath = "/tmp/.backimate_unlock_trigger"
+        // 2. Touch /tmp/.macground_unlock_trigger so the root WatchPaths LaunchDaemon also resets idleassetsd as root!
+        let triggerPath = "/tmp/.macground_unlock_trigger"
         try? "\(Date().timeIntervalSince1970)".write(toFile: triggerPath, atomically: true, encoding: .utf8)
     }
 
@@ -547,8 +547,10 @@ MODERN_AERIALS_ROOT = Path("/Library/Application Support/com.apple.wallpaper/aer
 MODERN_AERIALS_VIDEOS_DIR = MODERN_AERIALS_ROOT / "videos"
 MODERN_AERIALS_4K_DIR = MODERN_AERIALS_ROOT / "4KSDR240FPS"
 
-LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.backimate.lockreset.plist")
-UNLOCK_TRIGGER_FILE = Path("/tmp/.backimate_unlock_trigger")
+LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.macground.lockreset.plist")
+OLD_LAUNCH_DAEMON_PLIST = Path("/Library/LaunchDaemons/com.backimate.lockreset.plist")
+UNLOCK_TRIGGER_FILE = Path("/tmp/.macground_unlock_trigger")
+OLD_UNLOCK_TRIGGER_FILE = Path("/tmp/.backimate_unlock_trigger")
 
 HARDCODED_GOLDEN_GATE_ID = "4207734D-74FE-4F92-B5E1-6EC8DEE24A15"
 
@@ -614,19 +616,24 @@ def ensure_media_converter_binary() -> Path:
 
 def install_root_watchpaths_daemon():
     """
-    Installs a root `WatchPaths` LaunchDaemon (`/Library/LaunchDaemons/com.backimate.lockreset.plist`)
-    that watches `/tmp/.backimate_unlock_trigger` (touched by `desktop_video_player` in the user's
+    Installs a root `WatchPaths` LaunchDaemon (`/Library/LaunchDaemons/com.macground.lockreset.plist`)
+    that watches `/tmp/.macground_unlock_trigger` (touched by `desktop_video_player` in the user's
     Aqua session whenever `com.apple.screenIsUnlocked` fires) and kills `idleassetsd` and
     `WallpaperAerialsExtension` as `root` on every unlock!
     """
     if os.geteuid() != 0:
         return
     try:
+        if OLD_LAUNCH_DAEMON_PLIST.exists():
+            subprocess.run(["launchctl", "bootout", "system", str(OLD_LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
+            OLD_LAUNCH_DAEMON_PLIST.unlink(missing_ok=True)
+        OLD_UNLOCK_TRIGGER_FILE.unlink(missing_ok=True)
+
         UNLOCK_TRIGGER_FILE.write_text("init", encoding="utf-8")
         os.chmod(UNLOCK_TRIGGER_FILE, 0o666)
 
         plist_content = {
-            "Label": "com.backimate.lockreset",
+            "Label": "com.macground.lockreset",
             "ProgramArguments": [
                 "/bin/sh",
                 "-c",
@@ -1079,7 +1086,11 @@ def restore_lockscreen_aerials():
     if LAUNCH_DAEMON_PLIST.exists():
         subprocess.run(["launchctl", "bootout", "system", str(LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
         LAUNCH_DAEMON_PLIST.unlink(missing_ok=True)
+    if OLD_LAUNCH_DAEMON_PLIST.exists():
+        subprocess.run(["launchctl", "bootout", "system", str(OLD_LAUNCH_DAEMON_PLIST)], stderr=subprocess.DEVNULL)
+        OLD_LAUNCH_DAEMON_PLIST.unlink(missing_ok=True)
     UNLOCK_TRIGGER_FILE.unlink(missing_ok=True)
+    OLD_UNLOCK_TRIGGER_FILE.unlink(missing_ok=True)
 
     user_home = get_target_user_home()
     user_app_support_aerials = (
