@@ -287,6 +287,37 @@ func makeMOVWriter(outputURL: URL, width: Int, height: Int) -> (AVAssetWriter, A
         kCVPixelBufferHeightKey as String: height
     ]
 
+    // High quality 4K 60 FPS bitrate configuration (~50 Mbps target)
+    let compressionProps: [String: Any] = [
+        AVVideoAverageBitRateKey: 50_000_000,
+        AVVideoExpectedSourceFrameRateKey: 60
+    ]
+
+    for codec in candidateCodecs {
+        try? FileManager.default.removeItem(at: outputURL)
+        guard let w = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { continue }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: codec,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoCompressionPropertiesKey: compressionProps
+        ]
+        let inp = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        inp.expectsMediaDataInRealTime = false
+        let adp = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: inp,
+            sourcePixelBufferAttributes: sourcePixelBufferAttributes
+        )
+        if w.canAdd(inp) {
+            w.add(inp)
+            if w.startWriting() {
+                w.startSession(atSourceTime: .zero)
+                return (w, inp, adp)
+            }
+        }
+    }
+
+    // Fallback without explicit compression properties if hardware encoder requires defaults
     for codec in candidateCodecs {
         try? FileManager.default.removeItem(at: outputURL)
         guard let w = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { continue }
@@ -340,17 +371,17 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
         return false
     }
 
-    // Use the exact same timing cadence (0.06s / 16.67 FPS, timescale 600, ~120 frames) as the working GIF pipeline
+    // Silky-smooth 60 FPS lock screen pipeline (600 timescale, 10 ticks per frame)
     let srcFPS = Double(videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0)
-    let delay = 0.06
-    let targetFPS = 1.0 / delay
-    let skipRatio = max(1.0, srcFPS / targetFPS)
+    let targetFPS = 60.0
     let timescale: Int32 = 600
-    let step = CMTime(seconds: delay, preferredTimescale: timescale)
+    let step = CMTime(value: 10, timescale: timescale)
+    let dupPerFrame = max(1, Int(round(targetFPS / max(1.0, srcFPS))))
+    let skipRatio = max(1.0, srcFPS / targetFPS)
 
     let durationSec = max(0.1, CMTimeGetSeconds(asset.duration))
     let repeatCount = max(1, Int(ceil(6.0 / min(durationSec, 7.2))))
-    let maxTotalFrames = 120
+    let maxTotalFrames = 360 // 6.0 seconds of native 60 FPS 4K animation
 
     var currentTime = CMTime.zero
     var totalWritten = 0
@@ -401,13 +432,16 @@ func convertVideoTo4KMOV(videoURL: URL, outputURL: URL) -> Bool {
                 guard let validImg = cgImg else { return }
                 lastCGImage = validImg
 
-                while !writerInput.isReadyForMoreMediaData {
-                    Thread.sleep(forTimeInterval: 0.005)
-                }
-                if let buffer = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
-                    adaptor.append(buffer, withPresentationTime: currentTime)
-                    currentTime = CMTimeAdd(currentTime, step)
-                    totalWritten += 1
+                for _ in 0..<dupPerFrame {
+                    if totalWritten >= maxTotalFrames { break }
+                    while !writerInput.isReadyForMoreMediaData {
+                        Thread.sleep(forTimeInterval: 0.002)
+                    }
+                    if let buffer = makePixelBuffer(from: validImg, pool: adaptor.pixelBufferPool, width: targetW, height: targetH) {
+                        adaptor.append(buffer, withPresentationTime: currentTime)
+                        currentTime = CMTimeAdd(currentTime, step)
+                        totalWritten += 1
+                    }
                 }
             }
 
@@ -669,7 +703,7 @@ def prepare_lockscreen_mov(media_path: Path) -> Path:
 
     stat = media_path.stat()
     fingerprint = hashlib.sha256(
-        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_pipeline_v6".encode("utf-8")
+        f"{media_path.resolve()}:{stat.st_size}:{stat.st_mtime_ns}:via_4k_60fps_v7".encode("utf-8")
     ).hexdigest()[:12]
     converted_mov = CACHE_DIR / f"{media_path.stem}_{fingerprint}.mov"
 
